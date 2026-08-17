@@ -1,0 +1,47 @@
+state_file: .orsus_nav_state.json
+
+http:
+  connect_timeout_seconds: 3
+  read_timeout_seconds: 30
+  long_operation_timeout_seconds: 300
+  poll_interval_seconds: 1
+  service_start_timeout_seconds: 60
+  container_start_timeout_seconds: 180
+  mission_timeout_seconds: 0
+  read_retries: 2
+  retry_backoff_seconds: 0.5
+
+robots:
+  go2:
+    enabled: true
+    base_url: http://10.52.104.196:8898
+    expected_sn: GSM20260003
+    adapter_type: go2
+    scene_name: airs1f_3
+    bringup_mode: localization
+    relocalization:
+      mode: sequential
+    mission:
+      mode: standard
+      frame_id: map
+      target:
+        x: -5.303
+        y: 13.740
+        theta: -1.5987215948268056
+
+  scout:
+    enabled: true
+    base_url: http://10.52.104.210:8898
+    expected_sn: GSP20250002
+    adapter_type: scout
+    scene_name: airs_inter
+    bringup_mode: navigation
+    relocalization:
+      mode: sequential
+    mission:
+      mode: standard
+      frame_id: map
+      target:
+        x: 0.838
+        y: -2.761
+        theta: -1.5707963267948966

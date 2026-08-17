@@ -1,0 +1,31 @@
+[Unit]
+Description=Scout Car CAN Communication Node
+After=network.target
+
+[Service]
+Type=simple
+User=gs
+WorkingDirectory=/home/gs/workspace/projects/SCOUT_CAR/scout_car_ws
+Environment=HUB_ID=GS_MR10243906
+Environment=ROS_DISTRO=humble
+Environment=PYTHONPATH=/home/gs/workspace/projects/SCOUT_CAR/scout_car_ws/install/scout_car_test_package/lib/python3.10/site-packages
+Environment=AMENT_PREFIX_PATH=/home/gs/workspace/projects/SCOUT_CAR/scout_car_ws/install
+Environment=ROS_VERSION=2
+Environment=PYTHONUNBUFFERED=1
+
+# 设置ROS2环境
+ExecStartPre=/bin/bash -c "source /opt/ros/humble/setup.bash"
+ExecStartPre=/bin/bash -c "source /home/gs/workspace/projects/SCOUT_CAR/scout_car_ws/install/setup.bash"
+
+# 启动节点
+ExecStart=/bin/bash -c "source /opt/ros/humble/setup.bash && source /home/gs/workspace/projects/SCOUT_CAR/scout_car_ws/install/setup.bash && python3 /home/gs/workspace/projects/SCOUT_CAR/scout_car_ws/src/scout_car_test_package/scout_car/scout_subscriber.py"
+
+Restart=always
+RestartSec=10
+
+# 日志设置
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target 

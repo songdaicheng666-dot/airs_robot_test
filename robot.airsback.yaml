@@ -1,0 +1,52 @@
+state_file: .orsus_nav_state.json
+
+http:
+  connect_timeout_seconds: 3
+  read_timeout_seconds: 30
+  long_operation_timeout_seconds: 300
+  poll_interval_seconds: 1
+  service_start_timeout_seconds: 60
+  container_start_timeout_seconds: 180
+  mission_timeout_seconds: 0
+  read_retries: 2
+  retry_backoff_seconds: 0.5
+
+robots:
+  go2:
+    enabled: true
+    base_url: http://10.52.104.196:8898
+    expected_sn: GSM20260003
+    adapter_type: go2
+    scene_name: airsback
+    bringup_mode: localization
+    relocalization:
+      mode: sequential
+    mission:
+      mode: route
+      frame_id: map
+      cycles: 1
+      waypoints:
+        - {x: -49.31, y: -36.03, theta: -1.5882496193148399}
+        - {x: -47.87, y: -53.66, theta: -1.3264502315156903}
+        - {x: -44.82, y: -61.35, theta: -0.10471975511965978}
+        - {x: -38.25, y: -61.67, theta: 0.03490658503988659}
+
+  scout:
+    enabled: true
+    base_url: http://10.52.104.210:8898
+    expected_sn: GSP20250002
+    adapter_type: scout
+    scene_name: airsback
+    bringup_mode: navigation
+    relocalization:
+      mode: sequential
+    mission:
+      mode: route
+      frame_id: map
+      cycles: 1
+      waypoints:
+        - {x: -50.24, y: -24.58, theta: -1.6057029118347832}
+        - {x: -49.94, y: -28.58, theta: -1.4486232791552935}
+        - {x: -49.19, y: -32.63, theta: -2.007128639793479}
+        - {x: -50.74, y: -36.03, theta: -1.2740903539558606}
+        - {x: -49.54, y: -39.18, theta: -1.6580627893946132}

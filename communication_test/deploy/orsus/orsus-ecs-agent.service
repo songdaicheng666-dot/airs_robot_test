@@ -1,0 +1,28 @@
+[Unit]
+Description=Go2 Orsus ECS relay agent
+After=network-online.target robot-sport.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=gs
+Group=gs
+WorkingDirectory=/opt/orsus-ecs-agent
+EnvironmentFile=/etc/orsus-ecs-agent.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 /opt/orsus-ecs-agent/agent.py
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+
+[Install]
+WantedBy=multi-user.target

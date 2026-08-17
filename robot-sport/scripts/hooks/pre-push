@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+#
+# pre-push —— 双远程仓库的推送护栏。
+#
+# 本仓库同时对接内部远程和公开远程，两侧历史与 ref 互不相通。本钩子阻止两类事故：
+#
+#   1. 把只应存在于内部的内容推到公开远程
+#      —— 内部专用目录（如 CI 配置）、提交信息或文件内容中的基础设施标识
+#   2. 把公开分支（历史经过重写）推回内部远程，造成分叉
+#
+# 脚本本身不含任何内部信息，全部由本地 git config 提供（不入库）：
+#
+#   hooks.publicRemote    匹配公开远程 URL 的正则         默认 github\.com
+#   hooks.publicBranch    唯一允许推向公开远程的分支      默认 opensource
+#   hooks.publicTagRef    公开 tag 所在的 ref 命名空间    默认 refs/opensource-tags
+#   hooks.internalPath    禁止公开的路径，可重复配置      默认 .gitea
+#   hooks.leakPattern     内部标识正则（ERE）             无默认，未配置则跳过相关检查
+#   hooks.scanLimit       历史内容扫描的提交数上限        默认 500
+#
+# 安装：scripts/hooks/install.sh
+# 绕过：ALLOW_PUSH=1 git push ...
+
+set -uo pipefail
+
+remote_name="${1:-}"
+remote_url="${2:-}"
+
+if [ "${ALLOW_PUSH:-}" = "1" ]; then
+    echo "pre-push: ALLOW_PUSH=1，跳过全部检查" >&2
+    exit 0
+fi
+
+cfg() { git config --get "$1" 2>/dev/null || printf '%s' "$2"; }
+
+PUBLIC_REMOTE_RE="$(cfg hooks.publicRemote 'github\.com')"
+PUBLIC_BRANCH="$(cfg hooks.publicBranch 'opensource')"
+PUBLIC_TAG_REF="$(cfg hooks.publicTagRef 'refs/opensource-tags')"
+SCAN_LIMIT="$(cfg hooks.scanLimit '500')"
+LEAK_RE="$(git config --get hooks.leakPattern 2>/dev/null || true)"
+
+mapfile -t INTERNAL_PATHS < <(git config --get-all hooks.internalPath 2>/dev/null)
+[ "${#INTERNAL_PATHS[@]}" -eq 0 ] && INTERNAL_PATHS=('.gitea')
+
+fail=0
+die() { echo "pre-push: 阻止 —— $*" >&2; fail=1; }
+
+is_public=0
+[[ "$remote_url" =~ $PUBLIC_REMOTE_RE ]] && is_public=1
+
+if [ "$is_public" -eq 1 ] && [ -z "$LEAK_RE" ]; then
+    echo "pre-push: 警告 —— 未配置 hooks.leakPattern，标识扫描已跳过（仅做路径与 ref 检查）" >&2
+fi
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+    # 删除远程引用，放行
+    [[ "$local_sha" =~ ^0+$ ]] && continue
+
+    short="${local_ref#refs/heads/}"
+    short="${short#"$PUBLIC_TAG_REF"/}"
+    short="${short#refs/tags/}"
+
+    # ---------- 内部远程 ----------
+    if [ "$is_public" -eq 0 ]; then
+        if [ "$local_ref" = "refs/heads/$PUBLIC_BRANCH" ]; then
+            die "$PUBLIC_BRANCH → 内部远程 $remote_name。该分支历史已重写，推回去会与内部主线分叉。"
+        fi
+        continue
+    fi
+
+    # ---------- 公开远程 ----------
+    # (a) ref 白名单
+    case "$local_ref" in
+        refs/heads/"$PUBLIC_BRANCH") ;;
+        "$PUBLIC_TAG_REF"/*) ;;
+        refs/tags/*)
+            die "$local_ref 是内部 tag，指向未重写的历史。公开 tag 在 $PUBLIC_TAG_REF/*：
+        git push $remote_name $PUBLIC_TAG_REF/$short:refs/tags/$short" ;;
+        *)
+            die "$local_ref → 公开远程。只接受 $PUBLIC_BRANCH 分支和 $PUBLIC_TAG_REF/*，其他 ref 含内部内容。" ;;
+    esac
+
+    # (b) 确定待推送的提交范围
+    if [[ "$remote_sha" =~ ^0+$ ]] || ! git cat-file -e "$remote_sha^{commit}" 2>/dev/null; then
+        if git rev-list -n1 "$local_sha" --not --remotes="$remote_name" >/dev/null 2>&1; then
+            range=("$local_sha" --not --remotes="$remote_name")
+        else
+            range=("$local_sha")
+        fi
+    else
+        range=("$remote_sha..$local_sha")
+    fi
+
+    # (c) tip 的文件树不得包含内部路径
+    for p in "${INTERNAL_PATHS[@]}"; do
+        if git ls-tree -r --name-only "$local_sha" -- "$p" 2>/dev/null | grep -q .; then
+            die "$short 的文件树包含内部路径 $p"
+        fi
+        # (d) 待推送历史中不得有提交涉及内部路径
+        if [ -n "$(git log "${range[@]}" --oneline -- "$p" 2>/dev/null)" ]; then
+            die "$short 的待推送历史中存在涉及 $p 的提交"
+        fi
+    done
+
+    [ -z "$LEAK_RE" ] && continue
+
+    # (e) 提交信息不得含内部标识
+    bad_msg="$(git log "${range[@]}" -E --grep="$LEAK_RE" --format='    %h %s' 2>/dev/null | head -5)"
+    if [ -n "$bad_msg" ]; then
+        die "$short 的提交信息含内部标识："
+        printf '%s\n' "$bad_msg" >&2
+    fi
+
+    # (f) 文件内容不得含内部标识 —— tip 全量 + 历史（受 scanLimit 约束）
+    hit="$(git grep -I -l -E "$LEAK_RE" "$local_sha" -- . 2>/dev/null | sed "s#^$local_sha:#    #" | head -5)"
+    if [ -n "$hit" ]; then
+        die "$short 的文件内容含内部标识："
+        printf '%s\n' "$hit" >&2
+    fi
+
+    total="$(git rev-list --count "${range[@]}" 2>/dev/null || echo 0)"
+    if [ "$total" -gt "$SCAN_LIMIT" ]; then
+        echo "pre-push: 提示 —— $short 待推送 $total 个提交，超过 hooks.scanLimit=$SCAN_LIMIT，历史内容扫描仅覆盖最近 $SCAN_LIMIT 个" >&2
+    fi
+    while read -r c; do
+        h="$(git grep -I -l -E "$LEAK_RE" "$c" -- . 2>/dev/null | head -1)"
+        if [ -n "$h" ]; then
+            die "$short 的历史提交 ${c:0:8} 中有文件含内部标识：${h#*:}"
+            break
+        fi
+    done < <(git rev-list -n "$SCAN_LIMIT" "${range[@]}" 2>/dev/null)
+done
+
+if [ "$fail" -ne 0 ]; then
+    {
+        echo ""
+        echo "  推送已阻止。确认内容无误后可强行推送："
+        echo "      ALLOW_PUSH=1 git push ..."
+    } >&2
+    exit 1
+fi
+
+exit 0

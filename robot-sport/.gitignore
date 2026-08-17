@@ -1,0 +1,26 @@
+build/
+log/
+install/
+.vscode/
+.idea/
+__pycache__/
+*.pyc
+*.pyo
+.cache/
+.zed/
+dist/
+.codex
+.DS_Store
+
+# Debian 打包产物:本地经 bind mount 跑 dpkg-buildpackage 会落到宿主工作树;
+# CI 在 runner 上每个 job 重新 checkout、不受影响。这些一律不入库。
+*.deb
+*.buildinfo
+*.changes
+ros2_workspace_cpp/debian/robot-sport/
+ros2_workspace_cpp/debian/.colcon/
+ros2_workspace_cpp/debian/.debhelper/
+ros2_workspace_cpp/debian/files
+ros2_workspace_cpp/debian/*.substvars
+ros2_workspace_cpp/debian/*.debhelper*
+ros2_workspace_cpp/debian/debhelper-build-stamp

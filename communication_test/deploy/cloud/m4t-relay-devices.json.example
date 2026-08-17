@@ -1,0 +1,11 @@
+{
+  "M4T-001": {
+    "kind": "m4t",
+    "token": "replace_with_existing_m4t_device_token"
+  },
+  "ORSUS-GO2-GSM20260003": {
+    "kind": "orsus",
+    "token": "replace_with_dedicated_openssl_rand_hex_32_value",
+    "expected_sn": "GSM20260003"
+  }
+}

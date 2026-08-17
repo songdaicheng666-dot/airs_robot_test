@@ -1,0 +1,14 @@
+robot_switch_server:
+    ros__parameters:
+        http_listen_address: "0.0.0.0:9098"
+        service_wait_ms: 500
+        # Lynx high-level gait actions may confirm usage mode, RL state and
+        # gait sequentially (up to 3 x 1500 ms), so reserve end-to-end margin.
+        call_timeout_ms: 6000
+        adapter_connect_timeout_ms: 8000
+
+        # Device inventory configured by file.
+        enabled_adapter_types:
+            - "go2"
+            - "lynx"
+            - "scout"

@@ -1,0 +1,111 @@
+robot-sport (0.1.9-1) stable; urgency=medium
+
+  * fix(adapter_scout): use the Scout USB-CAN SocketCAN interface (can2)
+    instead of the unrelated onboard can0 controller.
+
+ -- robot-sport <gs-dev@example.com>  Sun, 09 Aug 2026 15:20:00 +0800
+
+robot-sport (0.1.8-1) stable; urgency=medium
+
+  * feat(adapter_scout): add the Scout SocketCAN adapter with command
+    validation, watchdog zero-stop behavior, health reporting, and tests.
+  * chore(robot_switch_server): enable the scout adapter type by default.
+
+ -- robot-sport <gs-dev@example.com>  Sat, 08 Aug 2026 16:14:00 +0800
+
+robot-sport (0.1.7-1) stable; urgency=medium
+
+  * feat(adapter_lynx): support mode-aware velocity dispatch (normalized
+    Command=21 in regular mode, absolute Command=25 in navigation mode) while
+    keeping ROS cmd_vel in SI units; expose regular/navigation mode, RL
+    control, and standard/agile flat/stairs gait actions through ROS2 and the
+    HTTP motion API, with gait transitions serializing mode/RL prep, a
+    zero-velocity send, and BasicStatus confirmation.
+  * fix(adapter_lynx): reject stale, non-finite, unsupported, or unsafe control
+    states; keep legacy walk as a standard-flat alias and reject undefined trot
+    gait 4098 without sending it to the robot.
+  * feat: add motions[].display_name to MotionDescriptor (id fallback when
+    empty) and mirror it in the robot_switch_server motion cache, so
+    /system_info always reports a non-empty label for all 16 in-tree motions
+    (lynx 10, go2 4, fake 2).
+  * chore(robot_switch_server): increase the default motion RPC timeout to 6000
+    ms for confirmed mode, RL-state, and gait transition sequences.
+  * test: cover Lynx Command=21/25 payloads, SI limiting, and the
+    navigation-to-RL-to-agile-gait confirmation sequence; add
+    robot_adapter_interfaces' first gtest target for the display_name fallback
+    and struct field ordering.
+  * docs: document one-call agile gait control, mode-specific velocity units,
+    transition constraints, configuration, failure behavior, and
+    motions[].display_name across the /system_info and /motion API docs and
+    the adapter developer guide.
+
+ -- robot-sport <gs-dev@example.com>  Wed, 29 Jul 2026 15:57:51 +0800
+
+robot-sport (0.1.6-1) stable; urgency=medium
+
+  * fix(adapter_lynx): convert cmd_vel SI velocities to bounded Lynx Command=21
+    axis ratios after applying per-axis safety limits.
+  * test(adapter_lynx): cover velocity conversion, limiting, non-finite input,
+    and invalid conversion configuration.
+
+ -- robot-sport <gs-dev@example.com>  Thu, 16 Jul 2026 15:08:56 +0800
+
+robot-sport (0.1.5-1) stable; urgency=medium
+
+  * perf: less resources required.
+
+ -- robot-sport <gs-dev@example.com>  Tue, 23 Jun 2026 21:42:00 +0800
+
+robot-sport (0.1.4-1) unstable; urgency=medium
+
+  * fix(robot_adapter_interfaces): preserve AdapterClient shutdown loop while
+    using blocking spin_once waits to reduce idle CPU without changing RPC
+    lifecycle behavior.
+  * fix(remote_controller): disable websocketpp frame-level stdout logging to
+    avoid dumping WebSocket headers and payloads during control responses.
+  * docs(robot_switch_server): update CPU high-usage fix notes.
+
+ -- robot-sport <gs-dev@example.com>  Tue, 23 Jun 2026 21:42:00 +0800
+
+robot-sport (0.1.3-1) unstable; urgency=medium
+
+  * feat(motion): add POST /motion HTTP API and generic motion dispatch flow.
+  * feat(adapters): expose supported motion metadata in system_info across fake,
+    GO2, and Lynx adapters.
+  * fix(robot_switch_server): improve motion RPC error classification and drain
+    in-flight motion calls on Stop.
+  * feat(adapter_lynx): add soft_stop motion and align motion service names to
+    stand_up/sit_down.
+
+ -- robot-sport <gs-dev@example.com>  Tue, 12 May 2026 00:00:00 +0800
+
+robot-sport (0.1.2-1) unstable; urgency=medium
+
+  * feat(remote_controller): add MQTT subscriber transport for velocity commands.
+  * feat(remote_controller): add end-to-end logging for MQTT and ROS control flow.
+  * fix(mqtt): stabilize MQTT dispatch handling and response flow.
+  * chore(packaging): add Paho MQTT build dependencies for Debian packaging.
+
+ -- robot-sport <gs-dev@example.com>  Thu, 16 Apr 2026 00:00:00 +0000
+
+robot-sport (0.1.1-1) unstable; urgency=medium
+
+  * feat(http): add /adapters endpoint and standardize JSON response format.
+  * feat(robot_adapter_interfaces): add unified SystemInfoBuilder for standardized
+    /system_info schema.
+  * fix(adapters, switch_server): make health/system_info reflect real device state.
+  * chore(config): change default HTTP port from 8080 to 9098.
+
+ -- robot-sport <gs-dev@example.com>  Mon, 14 Apr 2026 00:00:00 +0000
+
+robot-sport (0.1.0-2) unstable; urgency=medium
+
+  * Fix systemd launch script compatibility with ROS setup.bash.
+
+ -- robot-sport <dev@example.com>  Fri, 27 Mar 2026 00:00:00 +0000
+
+robot-sport (0.1.0-1) unstable; urgency=medium
+
+  * Initial Debian package for the robot-sport ROS2 system.
+
+ -- robot-sport <dev@example.com>  Fri, 27 Mar 2026 00:00:00 +0000

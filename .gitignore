@@ -1,0 +1,16 @@
+.orsus_nav_state.json
+__pycache__/
+*.pyc
+.venv-communication/
+.pytest_cache/
+/7B_4bit/
+/LoRA/
+/model+sft/
+communication_test/data/
+communication_test/*.env
+communication_test/.private/
+communication_test/manifold3/.manifold3-sysroot/
+communication_test/manifold3/.cross-toolchain/
+build-m4t-relay/
+Payload-SDK-master/samples/sample_c/platform/linux/manifold3/application/dji_sdk_app_info_private.h
+Payload-SDK-master/samples/sample_c/platform/linux/manifold3/app_json/m4t_relay_config.json

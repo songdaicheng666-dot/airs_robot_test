@@ -1,0 +1,26 @@
+{
+  "websocket": {
+    "port": 9099,
+    "host": "0.0.0.0",
+    "max_connections": 10
+  },
+  "ros": {
+    "twist_topic_queue_size": 10,
+    "hub_id": "DEFAULT_HUB_ID"
+  },
+  "logging": {
+    "level": "INFO",
+    "enable_websocket_logs": true
+  },
+  "mqtt": {
+    "enabled": true,
+    "broker": "tcp://localhost:1883",
+    "region": "cn-sz",
+    "tenant_id": "gs",
+    "username": "",
+    "password": "",
+    "qos": 1,
+    "keep_alive_interval": 20,
+    "clean_session": true
+  }
+}

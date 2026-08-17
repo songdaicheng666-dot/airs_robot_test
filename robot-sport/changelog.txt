@@ -1,0 +1,30 @@
+2026-08-07
+
+- 目的：为 Scout 从旧 Python 控制接口迁移到当前 adapter 契约，并与上游导航模块桥接，形成实施前的设计基线；本次不修改运行代码。
+- 位置：新增 `ros2_workspace_cpp/docs/plans/2026-08-07-adapter-scout-migration-design.md`。
+- 位置：新增根目录 `changelog.txt`，用于按仓库规范持续记录后续变更的目的和位置。
+
+2026-08-07
+
+- 目的：根据传输方案决策，将 Scout 新 adapter 的 CAN 链路固定为 Linux SocketCAN `can0`，移除直接 USB/libusb 作为候选方案，并补充接口初始化、错误处理和测试计划；本次仍不修改运行代码。
+- 位置：更新 `ros2_workspace_cpp/docs/plans/2026-08-07-adapter-scout-migration-design.md` 的结论、包设计、服务语义、SocketCAN 传输、实施阶段、测试验收和待确认项。
+
+2026-08-07
+
+- 目的：按限定范围重新整理 Scout 开发计划，只保留旧接口迁移和 `adapter_scout` package 建设两项工作，移除不属于本轮开发范围的扩展议题；本次不修改运行代码。
+- 位置：重写 `ros2_workspace_cpp/docs/plans/2026-08-07-adapter-scout-migration-design.md`，明确接口映射、包结构、实施范围、测试计划、开发规范和完成标准。
+
+2026-08-07
+
+- 目的：实现 Scout 新标准 adapter，把统一 `cmd_vel` 转换为旧 Scout CAN 协议，并通过 Linux SocketCAN `can0` 完成上游导航到底盘的速度执行桥接。
+- 位置：新增 `ros2_workspace_cpp/src/adapter_scout/CMakeLists.txt`、`package.xml` 和 `config/adapter_scout.yaml`，定义 C++17 package、依赖、可执行文件、配置和定向测试目标。
+- 位置：新增 `ros2_workspace_cpp/src/adapter_scout/include/adapter_scout/scout_command_codec.hpp` 与 `src/scout_command_codec.cpp`，实现速度限幅、旧协议比例换算、`0x111` 大端控制帧及 `0x421` CAN 模式帧。
+- 位置：新增 `ros2_workspace_cpp/src/adapter_scout/include/adapter_scout/scout_can_client.hpp` 与 `src/scout_can_client.cpp`，实现 `can0` 状态检查、raw SocketCAN 绑定、标准 11-bit CAN 帧发送和 socket 生命周期管理。
+- 位置：新增 `ros2_workspace_cpp/src/adapter_scout/include/adapter_scout/scout_adapter_node.hpp`、`src/scout_adapter_node.cpp` 与 `src/main.cpp`，实现五个标准 adapter 服务、统一 `cmd_vel` 订阅、连接初始零速、断开/安全停车/退出零速和 500 ms 看门狗。
+- 位置：新增 `ros2_workspace_cpp/src/adapter_scout/test/test_scout_command_codec.cpp` 与 `test/test_scout_can_client.cpp`，覆盖协议向量、边界/异常输入、客户端错误路径和可选 `vcan0` 收发。
+- 位置：更新 `ros2_workspace_cpp/src/robot_switch_server/config/server.yaml`，将 `scout` 加入 `enabled_adapter_types` 白名单。
+- 位置：更新 `ros2_workspace_cpp/docs/plans/2026-08-07-adapter-scout-migration-design.md`，把状态改为已实现待实机联调，并记录连接后先发送零速度的安全行为。
+- 验证：`adapter_scout` 在 `-DROBOT_SPORT_WERROR=ON` 下定向构建通过；按仓库现有 CI 过滤规则运行 codec、CAN client 和 cppcheck 测试目标，3/3 目标通过，其中 codec 9 项通过、CAN client 3 项通过，`vcan0` 收发 1 项因环境没有 `vcan0` 跳过（当前 cppcheck 2.7 也按 ament 的已知性能保护策略跳过实际扫描）。
+- 验证：ROS 2 运行时可发现 `/adapter_scout/connect`、`disconnect`、`safe_stop`、`health`、`system_info` 五个标准服务；无 `can0` 时 health/system_info 正确返回不可用状态，safe_stop/disconnect 幂等成功，connect 明确返回接口不存在。
+- 验证：`robot_switch_server` 已加载包含 `scout` 的安装配置；本机 HTTP `POST /start?adapter_type=scout` 能推导并启动 `adapter_scout_node`，随后按预期把 `can0` 不存在写入失败详情并清理子进程。
+- 验证边界：当前系统缺少真实 `can0` 和 `vcan0`，未执行 CAN 总线收发、看门狗实帧或 Scout 实车低速联调；这些项目需要在 Orsus + Scout 环境完成。系统还缺少工作区既有的 `nlohmann_json`/`httplib` 开发依赖，本次只在 `/tmp` 解压临时依赖用于验证，没有向仓库或系统安装第三方文件。

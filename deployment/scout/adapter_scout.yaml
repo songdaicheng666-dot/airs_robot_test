@@ -1,0 +1,12 @@
+adapter_scout:
+    ros__parameters:
+        # Temporary hard-coded SocketCAN interface.
+        can_interface: "can2"
+
+        # Preserve the limits and scaling used by the legacy Scout controller.
+        max_linear_x_mps: 1.5
+        max_angular_z_radps: 1.3075
+
+        # Send zero velocity when valid commands stop arriving.
+        cmd_vel_timeout_ms: 500
+        watchdog_check_interval_ms: 100

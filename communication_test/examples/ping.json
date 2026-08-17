@@ -1,0 +1,6 @@
+{
+  "type": "PING",
+  "payload": {
+    "message": "hello manifold3"
+  }
+}

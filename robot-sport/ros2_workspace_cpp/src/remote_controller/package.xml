@@ -1,0 +1,25 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>remote_controller</name>
+  <version>0.0.0</version>
+  <description>TODO: Package description</description>
+  <maintainer email="1325694319@qq.com">zhq</maintainer>
+  <license>GPL-3.0-or-later</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>rclcpp</depend>
+  <depend>geometry_msgs</depend>
+  <depend>nlohmann_json</depend>
+  <depend>websocketpp</depend>
+  <depend>libpaho-mqtt-dev</depend>
+  <depend>libpaho-mqttpp-dev</depend>
+
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_lint_common</test_depend>
+  <test_depend>gtest</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

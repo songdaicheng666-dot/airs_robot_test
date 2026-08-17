@@ -1,0 +1,52 @@
+# Copy this file to robots.yaml, then select the correct map and add a mission.
+# discover does not require scene_name or mission and is always read-only.
+state_file: .orsus_nav_state.json
+
+http:
+  connect_timeout_seconds: 3
+  read_timeout_seconds: 30
+  long_operation_timeout_seconds: 300
+  poll_interval_seconds: 1
+  service_start_timeout_seconds: 60
+  container_start_timeout_seconds: 180
+  mission_timeout_seconds: 0
+  read_retries: 2
+  retry_backoff_seconds: 0.5
+
+robots:
+  go2:
+    enabled: true
+    base_url: http://10.52.104.196:8898
+    expected_sn: GSM20260003
+    adapter_type: go2
+    scene_name: CHANGE_ME
+    bringup_mode: navigation
+    relocalization:
+      mode: sequential
+    mission: null
+
+  scout:
+    enabled: true
+    base_url: http://10.52.104.210:8898
+    expected_sn: GSP20250002
+    adapter_type: scout
+    scene_name: CHANGE_ME
+    bringup_mode: navigation
+    relocalization:
+      mode: sequential
+    mission: null
+
+# Single-point mission example:
+# mission:
+#   mode: standard
+#   frame_id: map
+#   target: {x: 1.0, y: 2.0, theta: 0.0}
+#
+# Route mission example:
+# mission:
+#   mode: route
+#   frame_id: map
+#   cycles: 1
+#   waypoints:
+#     - {x: 1.0, y: 2.0, theta: 0.0}
+#     - {x: 3.0, y: 4.0, theta: 1.57}

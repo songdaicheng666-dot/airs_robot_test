@@ -1,0 +1,51 @@
+#!/usr/bin/make -f
+
+export ROS_DISTRO := humble
+export ROS_VERSION := 2
+export ROS_PYTHON_VERSION := 3
+export DEB_BUILD_MAINT_OPTIONS := hardening=+all
+export DEB_BUILD_OPTIONS := noautodbgsym
+
+COLCON_BASE := $(CURDIR)/debian/.colcon
+COLCON_BUILD_BASE := $(COLCON_BASE)/build
+COLCON_INSTALL_BASE := $(COLCON_BASE)/install
+COLCON_LOG_BASE := $(COLCON_BASE)/log
+PACKAGE_DIR := $(CURDIR)/debian/robot-sport
+ROS_PREFIX := $(PACKAGE_DIR)/opt/ros/$(ROS_DISTRO)
+
+%:
+	dh $@
+
+override_dh_auto_configure:
+	:
+
+override_dh_auto_build:
+	. /opt/ros/$(ROS_DISTRO)/setup.sh && \
+	colcon --log-base $(COLCON_LOG_BASE) build \
+		--merge-install \
+		--build-base $(COLCON_BUILD_BASE) \
+		--install-base $(COLCON_INSTALL_BASE) \
+		--cmake-args \
+			-DCMAKE_BUILD_TYPE=Release \
+			-DBUILD_TESTING=OFF
+
+override_dh_auto_test:
+	:
+
+override_dh_auto_install:
+	rm -rf $(PACKAGE_DIR)
+	mkdir -p $(ROS_PREFIX)
+	cp -a --no-preserve=ownership $(COLCON_INSTALL_BASE)/include $(ROS_PREFIX)/
+	cp -a --no-preserve=ownership $(COLCON_INSTALL_BASE)/lib $(ROS_PREFIX)/
+	cp -a --no-preserve=ownership $(COLCON_INSTALL_BASE)/share $(ROS_PREFIX)/
+	install -D -m 0644 debian/robot-sport.service $(PACKAGE_DIR)/etc/systemd/system/robot-sport.service
+	install -D -m 0755 debian/robot-sport-launch.sh $(PACKAGE_DIR)/usr/lib/robot-sport/launch-robot-sport.sh
+
+override_dh_shlibdeps:
+	dh_shlibdeps -l$(ROS_PREFIX)/lib --dpkg-shlibdeps-params=--ignore-missing-info
+
+override_dh_installsystemd:
+	:
+
+override_dh_auto_clean:
+	rm -rf $(COLCON_BASE)

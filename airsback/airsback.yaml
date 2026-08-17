@@ -1,0 +1,6 @@
+image: /maps/airsback/airsback.pgm
+resolution: 0.0500000007
+origin: [-57.665105056819073, -69.381944704428975, 0]
+negate: 0
+occupied_thresh: 0.5
+free_thresh: 0.19
