@@ -1,12 +1,17 @@
 # Matrice 4T 与 Go2 Orsus 5G 通信测试
 
+通过 ECS 下发 Go2/Scout 导航目标、远程取消并生成通信指标报告的新增流程见
+[`navigation_test/README.md`](../navigation_test/README.md)。原有 PING/STATUS_QUERY 联通测试仍可独立使用。
+
 这套程序用于验证以下链路：
 
 ```text
 电脑结构化 JSON -> 阿里云 -> M4T/Orsus 长轮询 -> 设备遥测 -> 阿里云 -> 电脑
 ```
 
-首版只允许 `PING` 和 `STATUS_QUERY`，没有 FlyTo、起飞、电机启动、Go2 运动或导航权限调用。联调时 M4T 应保持落地且电机关闭，Go2 应保持静止。
+`PING` 和 `STATUS_QUERY` 仍用于无运动联通测试。Go2/Scout 导航只通过独立的
+`navigation_test` 客户端开放，并受设备类型、固定地图、单活动任务、5G 路由和传输安全门禁保护。
+M4T 没有新增 FlyTo、起飞或电机启动权限，联调时仍应保持落地且电机关闭。
 
 ## 目录
 
@@ -46,7 +51,7 @@ HTTP 阶段的 Bearer Token 会以明文经过公网，因此只用于短时间�
 
 ```bash
 ssh root@120.24.74.70 'mkdir -p /opt/m4t-relay-source'
-scp -r communication_test root@120.24.74.70:/opt/m4t-relay-source/
+scp -r communication_test requirements.txt root@120.24.74.70:/opt/m4t-relay-source/
 ```
 
 登录 ECS 后执行：
@@ -59,7 +64,7 @@ sudo install -d -o root -g root /opt/m4t-relay
 sudo install -d -o m4trelay -g m4trelay /var/lib/m4t-relay
 sudo cp -a /opt/m4t-relay-source/communication_test /opt/m4t-relay/
 sudo python3 -m venv /opt/m4t-relay/venv
-sudo /opt/m4t-relay/venv/bin/pip install -r /opt/m4t-relay/communication_test/cloud/requirements.txt
+sudo /opt/m4t-relay/venv/bin/pip install -r /opt/m4t-relay-source/requirements.txt
 ```
 
 生成三个不同的 Token：
@@ -318,8 +323,8 @@ communication_test/deploy/orsus/build_vendor_archive.sh \
   /tmp/orsus-python-vendor.tar.gz
 ```
 
-Agent 会优先从 `/opt/orsus-ecs-agent/vendor` 加载 `requests`，不会修改系统 Python 包。安装脚本在
-没有传入隔离依赖包且系统无法导入 `requests` 时，才会尝试使用 APT。先根据示例创建私密配置，
+Agent 会优先从 `/opt/orsus-ecs-agent/vendor` 加载 `requests` 和 `PyYAML`，不会修改系统 Python 包。安装脚本在
+没有传入隔离依赖包且系统无法导入这些包时，才会尝试使用 APT。先根据示例创建私密配置，
 填入 ECS 注册表中同一枚 Orsus Token：
 
 ```bash
@@ -328,12 +333,13 @@ cp communication_test/deploy/orsus/orsus-ecs-agent.env.example \
 chmod 600 communication_test/.private/orsus-ecs-agent.env
 ```
 
-通过有线管理口上传三个文件。Go2 和 Scout 的有线地址都可能是 `192.168.123.100`，因此使用
+通过有线管理口上传 Agent、导航控制器和部署资源。Go2 和 Scout 的有线地址都可能是 `192.168.123.100`，因此使用
 独立 `HostKeyAlias`：
 
 ```bash
 scp -o HostKeyAlias=orsus-go2-wired \
   communication_test/orsus/agent.py \
+  orsus_nav.py \
   communication_test/deploy/orsus/orsus-ecs-agent.service \
   communication_test/.private/orsus-ecs-agent.env \
   /tmp/orsus-python-vendor.tar.gz \
@@ -348,10 +354,12 @@ ssh -t -o HostKeyAlias=orsus-go2-wired gs@192.168.123.100 \
     /tmp/agent.py \
     /tmp/orsus-ecs-agent.env \
     /tmp/orsus-ecs-agent.service \
-    /tmp/orsus-python-vendor.tar.gz'
+    /tmp/orsus-python-vendor.tar.gz \
+    /tmp/orsus_nav.py'
 ```
 
-服务以 `gs` 用户运行，只读取本机 Edge Core 状态。检查服务和日志：
+服务以 `gs` 用户运行；状态查询保持只读，只有通过导航安全门禁的 `NAVIGATE`/`CANCEL_NAVIGATION`
+才会调用 Edge Core 写接口。检查服务和日志：
 
 ```bash
 ssh -o HostKeyAlias=orsus-go2-wired gs@192.168.123.100 \
@@ -379,7 +387,7 @@ python3 -m communication_test.pc.client status
 
 ### 10.4 安全边界
 
-- 云端只接受 `PING` 和 `STATUS_QUERY`，Agent 中没有运动或导航写接口。
-- 当前公网 HTTP 会明文传输 Bearer Token，只适合本轮无运动联调；Token 泄漏或切换 HTTPS 后必须轮换。
+- M4T 仍只接受 `PING` 和 `STATUS_QUERY`；Orsus 额外接受严格校验的 `NAVIGATE` 和 `CANCEL_NAVIGATION`。
+- 公网 HTTP 会明文传输 Bearer Token 和导航目标。只有 ECS、Agent 和本机三端同时显式启用不安全开关时才允许测试，结束后必须轮换 Token。
 - Agent 日志不得出现 Token；Uvicorn `8000` 继续只监听 ECS 本机，公网仅访问 Nginx `80`。
-- 增加任何 Go2 运动、导航或急停命令前，必须先部署 HTTPS 并重新进行现场安全评审。
+- 正式使用必须部署 HTTPS；完整导航部署、取消、指标和实机验收步骤见 `navigation_test/README.md`。

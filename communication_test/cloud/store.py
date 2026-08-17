@@ -26,6 +26,10 @@ class InvalidStateTransition(StoreError):
     pass
 
 
+class ActiveNavigationConflict(StoreError):
+    pass
+
+
 def utc_text(timestamp: float) -> str:
     return datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat().replace("+00:00", "Z")
 
@@ -64,6 +68,11 @@ class RelayStore:
                     lease_until REAL,
                     delivery_count INTEGER NOT NULL DEFAULT 0,
                     result_json TEXT,
+                    progress_json TEXT,
+                    first_delivered_at REAL,
+                    received_at REAL,
+                    terminal_at REAL,
+                    device_recorded_at TEXT,
                     error_message TEXT
                 );
                 CREATE INDEX IF NOT EXISTS idx_commands_delivery
@@ -75,6 +84,25 @@ class RelayStore:
                 );
                 """
             )
+            columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(commands)").fetchall()
+            }
+            migrations = {
+                "progress_json": "TEXT",
+                "first_delivered_at": "REAL",
+                "received_at": "REAL",
+                "terminal_at": "REAL",
+                "device_recorded_at": "TEXT",
+            }
+            for name, column_type in migrations.items():
+                if name not in columns:
+                    connection.execute(f"ALTER TABLE commands ADD COLUMN {name} {column_type}")
+
+    @staticmethod
+    def _optional_utc(row: sqlite3.Row, name: str) -> str | None:
+        value = row[name]
+        return utc_text(value) if value is not None else None
 
     @staticmethod
     def _command_dict(row: sqlite3.Row) -> dict[str, Any]:
@@ -88,7 +116,12 @@ class RelayStore:
             "created_at": utc_text(row["created_at"]),
             "updated_at": utc_text(row["updated_at"]),
             "expires_at": utc_text(row["expires_at"]),
+            "first_delivered_at": RelayStore._optional_utc(row, "first_delivered_at"),
+            "received_at": RelayStore._optional_utc(row, "received_at"),
+            "terminal_at": RelayStore._optional_utc(row, "terminal_at"),
+            "device_recorded_at": row["device_recorded_at"],
             "delivery_count": row["delivery_count"],
+            "progress": json.loads(row["progress_json"]) if row["progress_json"] else None,
             "result": json.loads(row["result_json"]) if row["result_json"] else None,
             "error": row["error_message"],
         }
@@ -119,6 +152,46 @@ class RelayStore:
                 connection.commit()
                 return self._command_dict(existing), False
 
+            if command_type == "CANCEL_NAVIGATION":
+                target_id = payload.get("navigation_command_id")
+                target = connection.execute(
+                    "SELECT * FROM commands WHERE command_id = ? AND device_id = ?",
+                    (target_id, device_id),
+                ).fetchone()
+                if target is None:
+                    connection.rollback()
+                    raise CommandNotFound(str(target_id))
+                if target["command_type"] != "NAVIGATE":
+                    connection.rollback()
+                    raise InvalidStateTransition("cancel target is not a navigation command")
+
+            if command_type == "NAVIGATE":
+                connection.execute(
+                    """
+                    UPDATE commands
+                    SET state = 'FAILED', updated_at = ?, terminal_at = COALESCE(terminal_at, ?),
+                        error_message = 'command expired before receipt', lease_until = NULL
+                    WHERE device_id = ? AND command_type = 'NAVIGATE'
+                      AND state IN ('QUEUED', 'DELIVERED', 'RECEIVED', 'RUNNING')
+                      AND expires_at <= ?
+                    """,
+                    (now, now, device_id, now),
+                )
+                active = connection.execute(
+                    """
+                    SELECT command_id FROM commands
+                    WHERE device_id = ? AND command_type = 'NAVIGATE'
+                      AND state IN ('QUEUED', 'DELIVERED', 'RECEIVED', 'RUNNING')
+                    ORDER BY created_at ASC LIMIT 1
+                    """,
+                    (device_id,),
+                ).fetchone()
+                if active is not None:
+                    connection.rollback()
+                    raise ActiveNavigationConflict(
+                        f"device already has active navigation command {active['command_id']}"
+                    )
+
             connection.execute(
                 """
                 INSERT INTO commands (
@@ -148,10 +221,11 @@ class RelayStore:
             connection.execute(
                 """
                 UPDATE commands
-                SET state = 'FAILED', updated_at = ?, error_message = 'command expired before receipt', lease_until = NULL
-                WHERE device_id = ? AND state IN ('QUEUED', 'DELIVERED', 'RECEIVED') AND expires_at <= ?
+                SET state = 'FAILED', updated_at = ?, terminal_at = COALESCE(terminal_at, ?),
+                    error_message = 'command expired before receipt', lease_until = NULL
+                WHERE device_id = ? AND state IN ('QUEUED', 'DELIVERED', 'RECEIVED', 'RUNNING') AND expires_at <= ?
                 """,
-                (now, device_id, now),
+                (now, now, device_id, now),
             )
             row = connection.execute(
                 """
@@ -159,7 +233,7 @@ class RelayStore:
                 WHERE device_id = ?
                   AND (
                       state = 'QUEUED'
-                      OR (state IN ('DELIVERED', 'RECEIVED') AND COALESCE(lease_until, 0) <= ?)
+                      OR (state IN ('DELIVERED', 'RECEIVED', 'RUNNING') AND COALESCE(lease_until, 0) <= ?)
                   )
                   AND expires_at > ?
                 ORDER BY created_at ASC
@@ -173,10 +247,12 @@ class RelayStore:
             connection.execute(
                 """
                 UPDATE commands
-                SET state = 'DELIVERED', updated_at = ?, lease_until = ?, delivery_count = delivery_count + 1
+                SET state = 'DELIVERED', updated_at = ?, lease_until = ?,
+                    first_delivered_at = COALESCE(first_delivered_at, ?),
+                    delivery_count = delivery_count + 1
                 WHERE command_id = ?
                 """,
-                (now, now + self.lease_seconds, row["command_id"]),
+                (now, now + self.lease_seconds, now, row["command_id"]),
             )
             claimed = connection.execute(
                 "SELECT * FROM commands WHERE command_id = ?", (row["command_id"],)
@@ -191,6 +267,8 @@ class RelayStore:
         new_state: str,
         result: dict[str, Any] | None,
         error_message: str | None,
+        progress: dict[str, Any] | None = None,
+        device_recorded_at: str | None = None,
     ) -> dict[str, Any]:
         now = time.time()
         with self._write_lock, self._connect() as connection:
@@ -204,35 +282,61 @@ class RelayStore:
 
             current_state = row["state"]
             allowed = {
-                "DELIVERED": {"RECEIVED", "COMPLETED", "FAILED"},
-                "RECEIVED": {"RECEIVED", "COMPLETED", "FAILED"},
+                "DELIVERED": {"RECEIVED", "RUNNING", "COMPLETED", "FAILED", "CANCELLED"},
+                "RECEIVED": {"RECEIVED", "RUNNING", "COMPLETED", "FAILED", "CANCELLED"},
+                "RUNNING": {"RUNNING", "COMPLETED", "FAILED", "CANCELLED"},
                 "COMPLETED": {"COMPLETED"},
                 "FAILED": {"FAILED"},
+                "CANCELLED": {"CANCELLED"},
             }
             if new_state not in allowed.get(current_state, set()):
                 connection.rollback()
                 raise InvalidStateTransition(f"cannot change command from {current_state} to {new_state}")
 
-            if new_state == "RECEIVED":
+            progress_json = (
+                json.dumps(progress, ensure_ascii=False, separators=(",", ":"))
+                if progress is not None
+                else None
+            )
+            if new_state in {"RECEIVED", "RUNNING"}:
                 connection.execute(
                     """
-                    UPDATE commands
-                    SET state = 'RECEIVED', updated_at = ?, lease_until = ?, result_json = NULL, error_message = NULL
-                    WHERE command_id = ?
-                    """,
-                    (now, now + self.lease_seconds, command_id),
-                )
-            elif current_state != new_state:
-                connection.execute(
-                    """
-                    UPDATE commands
-                    SET state = ?, updated_at = ?, lease_until = NULL, result_json = ?, error_message = ?
+                    UPDATE commands SET
+                        state = ?, updated_at = ?, lease_until = ?, expires_at = ?,
+                        received_at = CASE WHEN ? = 'RECEIVED' THEN COALESCE(received_at, ?) ELSE received_at END,
+                        progress_json = COALESCE(?, progress_json), result_json = NULL,
+                        device_recorded_at = COALESCE(?, device_recorded_at), error_message = NULL
                     WHERE command_id = ?
                     """,
                     (
                         new_state,
                         now,
+                        now + self.lease_seconds,
+                        now + self.command_ttl_seconds,
+                        new_state,
+                        now,
+                        progress_json,
+                        device_recorded_at,
+                        command_id,
+                    ),
+                )
+            elif current_state != new_state:
+                connection.execute(
+                    """
+                    UPDATE commands SET
+                        state = ?, updated_at = ?, terminal_at = COALESCE(terminal_at, ?),
+                        lease_until = NULL, progress_json = COALESCE(?, progress_json),
+                        result_json = ?, device_recorded_at = COALESCE(?, device_recorded_at),
+                        error_message = ?
+                    WHERE command_id = ?
+                    """,
+                    (
+                        new_state,
+                        now,
+                        now,
+                        progress_json,
                         json.dumps(result, ensure_ascii=False, separators=(",", ":")) if result is not None else None,
+                        device_recorded_at,
                         error_message,
                         command_id,
                     ),
@@ -240,6 +344,14 @@ class RelayStore:
             updated = connection.execute("SELECT * FROM commands WHERE command_id = ?", (command_id,)).fetchone()
             connection.commit()
         return self._command_dict(updated)
+
+    def validate_cancel_target(self, device_id: str, command_id: str) -> dict[str, Any]:
+        command = self.get_command(command_id)
+        if command["device_id"] != device_id:
+            raise CommandNotFound(command_id)
+        if command["type"] != "NAVIGATE":
+            raise InvalidStateTransition("cancel target is not a navigation command")
+        return command
 
     def get_command(self, command_id: str) -> dict[str, Any]:
         with self._connect() as connection:

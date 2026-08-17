@@ -10,6 +10,7 @@ from httpx import ASGITransport, AsyncClient
 
 from communication_test.cloud.app import create_app
 from communication_test.cloud.config import DeviceSettings, Settings, load_device_registry
+from communication_test.cloud.store import RelayStore
 
 
 OPERATOR_TOKEN = "operator-token-000000000000000000000000"
@@ -52,6 +53,14 @@ def make_multi_device_app(database_path: Path):
             },
         )
     )
+
+
+def navigation_request(request_id: str | None = None) -> dict:
+    return {
+        "client_request_id": request_id or str(uuid.uuid4()),
+        "type": "NAVIGATE",
+        "payload": {"target": {"x": 1.25, "y": -2.5, "theta": 0.75}},
+    }
 
 
 def auth(token: str) -> dict[str, str]:
@@ -340,3 +349,183 @@ def test_load_device_registry(tmp_path: Path) -> None:
     devices = load_device_registry(registry)
     assert set(devices) == {"M4T-001", ORSUS_DEVICE_ID}
     assert devices[ORSUS_DEVICE_ID].expected_sn == "GSM20260003"
+
+
+@pytest.mark.anyio
+async def test_navigation_lifecycle_progress_and_busy_conflict(tmp_path: Path) -> None:
+    transport = ASGITransport(app=make_multi_device_app(tmp_path / "relay.db"))
+    async with AsyncClient(transport=transport, base_url="https://test") as client:
+        created = await client.post(
+            f"/v1/devices/{ORSUS_DEVICE_ID}/commands",
+            headers=auth(OPERATOR_TOKEN),
+            json=navigation_request(),
+        )
+        assert created.status_code == 201
+        command_id = created.json()["command_id"]
+
+        busy = await client.post(
+            f"/v1/devices/{ORSUS_DEVICE_ID}/commands",
+            headers=auth(OPERATOR_TOKEN),
+            json=navigation_request(),
+        )
+        assert busy.status_code == 409
+        assert command_id in busy.json()["detail"]
+
+        claimed = await client.get(
+            f"/v1/devices/{ORSUS_DEVICE_ID}/commands/next?timeout_s=0",
+            headers=auth(ORSUS_TOKEN),
+        )
+        assert claimed.json()["first_delivered_at"] is not None
+
+        recorded_at = datetime.now(tz=timezone.utc).isoformat()
+        received = await client.post(
+            f"/v1/devices/{ORSUS_DEVICE_ID}/commands/{command_id}/state",
+            headers=auth(ORSUS_TOKEN),
+            json={"state": "RECEIVED", "device_recorded_at": recorded_at},
+        )
+        assert received.json()["received_at"] is not None
+
+        running = await client.post(
+            f"/v1/devices/{ORSUS_DEVICE_ID}/commands/{command_id}/state",
+            headers=auth(ORSUS_TOKEN),
+            json={
+                "state": "RUNNING",
+                "progress": {"phase": "mission", "mission_id": "mission-1"},
+                "device_recorded_at": recorded_at,
+            },
+        )
+        assert running.json()["progress"]["mission_id"] == "mission-1"
+
+        completed = await client.post(
+            f"/v1/devices/{ORSUS_DEVICE_ID}/commands/{command_id}/state",
+            headers=auth(ORSUS_TOKEN),
+            json={
+                "state": "COMPLETED",
+                "result": {"status": "completed", "mission_id": "mission-1"},
+                "device_recorded_at": recorded_at,
+            },
+        )
+        assert completed.json()["terminal_at"] is not None
+        assert completed.json()["device_recorded_at"].endswith("Z")
+
+
+@pytest.mark.anyio
+async def test_navigation_transport_type_validation_and_cancel(tmp_path: Path) -> None:
+    app = make_multi_device_app(tmp_path / "relay.db")
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as insecure:
+        rejected = await insecure.post(
+            f"/v1/devices/{ORSUS_DEVICE_ID}/commands",
+            headers=auth(OPERATOR_TOKEN),
+            json=navigation_request(),
+        )
+        assert rejected.status_code == 403
+
+    secure_transport = ASGITransport(app=app)
+    async with AsyncClient(transport=secure_transport, base_url="https://test") as client:
+        wrong_kind = await client.post(
+            "/v1/devices/M4T-001/commands",
+            headers=auth(OPERATOR_TOKEN),
+            json=navigation_request(),
+        )
+        assert wrong_kind.status_code == 422
+
+        invalid = navigation_request()
+        invalid["payload"]["target"].pop("theta")
+        invalid_response = await client.post(
+            f"/v1/devices/{ORSUS_DEVICE_ID}/commands",
+            headers=auth(OPERATOR_TOKEN),
+            json=invalid,
+        )
+        assert invalid_response.status_code == 422
+
+        navigation = await client.post(
+            f"/v1/devices/{ORSUS_DEVICE_ID}/commands",
+            headers=auth(OPERATOR_TOKEN),
+            json=navigation_request(),
+        )
+        command_id = navigation.json()["command_id"]
+        claimed = await client.get(
+            f"/v1/devices/{ORSUS_DEVICE_ID}/commands/next?timeout_s=0",
+            headers=auth(ORSUS_TOKEN),
+        )
+        assert claimed.json()["command_id"] == command_id
+        terminal = await client.post(
+            f"/v1/devices/{ORSUS_DEVICE_ID}/commands/{command_id}/state",
+            headers=auth(ORSUS_TOKEN),
+            json={"state": "CANCELLED"},
+        )
+        assert terminal.status_code == 200
+
+        cancel_request_id = str(uuid.uuid4())
+        cancel_body = {
+            "client_request_id": cancel_request_id,
+            "type": "CANCEL_NAVIGATION",
+            "payload": {"navigation_command_id": command_id},
+        }
+        cancel = await client.post(
+            f"/v1/devices/{ORSUS_DEVICE_ID}/commands",
+            headers=auth(OPERATOR_TOKEN),
+            json=cancel_body,
+        )
+        assert cancel.status_code == 201
+
+        repeated = await client.post(
+            f"/v1/devices/{ORSUS_DEVICE_ID}/commands",
+            headers=auth(OPERATOR_TOKEN),
+            json=cancel_body,
+        )
+        assert repeated.status_code == 200
+        assert repeated.json()["command_id"] == cancel.json()["command_id"]
+
+
+@pytest.mark.anyio
+async def test_time_endpoint_accepts_operator_and_device_tokens(tmp_path: Path) -> None:
+    transport = ASGITransport(app=make_multi_device_app(tmp_path / "relay.db"))
+    async with AsyncClient(transport=transport, base_url="https://test") as client:
+        for token in (OPERATOR_TOKEN, ORSUS_TOKEN):
+            response = await client.get("/v1/time", headers=auth(token))
+            assert response.status_code == 200
+            assert response.json()["server_time"].endswith("Z")
+            assert response.json()["unix_time_ns"] > 0
+        assert (await client.get("/v1/time")).status_code == 401
+
+
+def test_store_migrates_legacy_command_table(tmp_path: Path) -> None:
+    database = tmp_path / "legacy.db"
+    with sqlite3.connect(database) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE commands (
+                command_id TEXT PRIMARY KEY,
+                client_request_id TEXT NOT NULL UNIQUE,
+                device_id TEXT NOT NULL,
+                command_type TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                state TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                expires_at REAL NOT NULL,
+                lease_until REAL,
+                delivery_count INTEGER NOT NULL DEFAULT 0,
+                result_json TEXT,
+                error_message TEXT
+            );
+            CREATE TABLE devices (
+                device_id TEXT PRIMARY KEY,
+                last_seen_at REAL NOT NULL,
+                telemetry_json TEXT NOT NULL
+            );
+            """
+        )
+
+    RelayStore(database, lease_seconds=3, command_ttl_seconds=60)
+    with sqlite3.connect(database) as connection:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(commands)")}
+    assert {
+        "progress_json",
+        "first_delivered_at",
+        "received_at",
+        "terminal_at",
+        "device_recorded_at",
+    } <= columns

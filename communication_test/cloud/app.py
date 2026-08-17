@@ -2,16 +2,23 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import math
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Literal
 from uuid import UUID
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Response, status
-from pydantic import BaseModel, ConfigDict, Field
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response, status
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .config import DeviceSettings, Settings
-from .store import CommandNotFound, DuplicateConflict, InvalidStateTransition, RelayStore
+from .store import (
+    ActiveNavigationConflict,
+    CommandNotFound,
+    DuplicateConflict,
+    InvalidStateTransition,
+    RelayStore,
+)
 
 
 class StrictModel(BaseModel):
@@ -20,14 +27,46 @@ class StrictModel(BaseModel):
 
 class CommandCreate(StrictModel):
     client_request_id: UUID
-    type: Literal["PING", "STATUS_QUERY"]
+    type: Literal["PING", "STATUS_QUERY", "NAVIGATE", "CANCEL_NAVIGATION"]
     payload: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_command_payload(self) -> "CommandCreate":
+        if self.type == "NAVIGATE":
+            parsed = NavigatePayload.model_validate(self.payload)
+            self.payload = parsed.model_dump(mode="json")
+        elif self.type == "CANCEL_NAVIGATION":
+            parsed = CancelNavigationPayload.model_validate(self.payload)
+            self.payload = parsed.model_dump(mode="json")
+        return self
 
 
 class CommandStateUpdate(StrictModel):
-    state: Literal["RECEIVED", "COMPLETED", "FAILED"]
+    state: Literal["RECEIVED", "RUNNING", "COMPLETED", "FAILED", "CANCELLED"]
+    progress: dict[str, Any] | None = None
     result: dict[str, Any] | None = None
     error: str | None = Field(default=None, max_length=1024)
+    device_recorded_at: datetime | None = None
+
+
+class NavigationTarget(StrictModel):
+    x: float
+    y: float
+    theta: float
+
+    @model_validator(mode="after")
+    def finite_values(self) -> "NavigationTarget":
+        if not all(math.isfinite(value) for value in (self.x, self.y, self.theta)):
+            raise ValueError("navigation coordinates must be finite")
+        return self
+
+
+class NavigatePayload(StrictModel):
+    target: NavigationTarget
+
+
+class CancelNavigationPayload(StrictModel):
+    navigation_command_id: UUID
 
 
 class FlightTelemetry(StrictModel):
@@ -109,6 +148,7 @@ class OrsusNetworkTelemetry(StrictModel):
 class OrsusNavigationTelemetry(StrictModel):
     container: dict[str, Any] | None = None
     status: dict[str, Any] | None = None
+    profile: dict[str, Any] | None = None
 
 
 class OrsusTelemetryError(StrictModel):
@@ -138,7 +178,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     devices = settings.registered_devices
     store = RelayStore(settings.database_path, settings.command_lease_seconds, settings.command_ttl_seconds)
     command_available = asyncio.Condition()
-    app = FastAPI(title="Edge Device Cloud Relay", version="2.0.0")
+    app = FastAPI(title="Edge Device Cloud Relay", version="3.0.0")
     app.state.settings = settings
     app.state.store = store
 
@@ -174,9 +214,32 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     operator_auth = authenticate(settings.operator_token)
 
+    async def participant_auth(authorization: str | None = Header(default=None)) -> None:
+        prefix = "Bearer "
+        if authorization is None or not authorization.startswith(prefix):
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="missing bearer token")
+        token = authorization[len(prefix):]
+        candidates = [settings.operator_token, *(device.token for device in devices.values())]
+        if not any(hmac.compare_digest(token, candidate) for candidate in candidates):
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid bearer token")
+
+    def require_safe_navigation_transport(request: Request) -> None:
+        forwarded = request.headers.get("x-forwarded-proto", request.url.scheme)
+        scheme = forwarded.split(",", 1)[0].strip().lower()
+        if scheme != "https" and not settings.allow_insecure_navigation:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="navigation over insecure HTTP is disabled",
+            )
+
     @app.get("/health")
     async def health() -> dict[str, str]:
         return {"status": "ok"}
+
+    @app.get("/v1/time")
+    async def relay_time(_auth: None = Depends(participant_auth)) -> dict[str, Any]:
+        now = datetime.now(tz=timezone.utc)
+        return {"server_time": now.isoformat().replace("+00:00", "Z"), "unix_time_ns": time.time_ns()}
 
     @app.get("/v1/devices")
     async def list_devices(_auth: None = Depends(operator_auth)) -> dict[str, list[dict[str, Any]]]:
@@ -196,19 +259,29 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.post("/v1/devices/{device_id}/commands", status_code=status.HTTP_201_CREATED)
     async def submit_command(
         device_id: str,
-        request: CommandCreate,
+        command_request: CommandCreate,
         response: Response,
+        request: Request,
         _auth: None = Depends(operator_auth),
     ) -> dict[str, Any]:
-        require_known_device(device_id)
+        device = require_known_device(device_id)
+        if command_request.type in {"NAVIGATE", "CANCEL_NAVIGATION"}:
+            require_safe_navigation_transport(request)
+            if device.kind != "orsus":
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail="navigation commands require an Orsus device",
+                )
         try:
             command, created = store.create_command(
                 device_id,
-                str(request.client_request_id),
-                request.type,
-                request.payload,
+                str(command_request.client_request_id),
+                command_request.type,
+                command_request.payload,
             )
-        except DuplicateConflict as exc:
+        except CommandNotFound as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="navigation command not found") from exc
+        except (DuplicateConflict, ActiveNavigationConflict, InvalidStateTransition) as exc:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
         if not created:
             response.status_code = status.HTTP_200_OK
@@ -254,6 +327,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 request.state,
                 request.result,
                 request.error,
+                request.progress,
+                request.device_recorded_at.isoformat().replace("+00:00", "Z")
+                if request.device_recorded_at is not None
+                else None,
             )
         except CommandNotFound as exc:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="command not found") from exc

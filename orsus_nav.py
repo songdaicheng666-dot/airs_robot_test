@@ -652,6 +652,7 @@ class DualRobotController:
         selected: Iterable[RobotConfig],
         *,
         clients: Optional[Mapping[str, OrsusClient]] = None,
+        progress_callback: Optional[Callable[[str, dict[str, Any]], None]] = None,
     ):
         self.config = config
         self.robots = {robot.name: robot for robot in selected}
@@ -663,10 +664,20 @@ class DualRobotController:
         self._active_lock = threading.Lock()
         self._active_missions: dict[str, str] = {}
         self._active_relocalizations: set[str] = set()
+        self.progress_callback = progress_callback
 
     def close(self) -> None:
         for client in self.clients.values():
             client.close()
+
+    def _emit_progress(self, robot_name: str, phase: str, status: str, **details: Any) -> None:
+        if self.progress_callback is None:
+            return
+        event = {"phase": phase, "status": status, **details}
+        try:
+            self.progress_callback(robot_name, event)
+        except Exception as exc:  # Progress reporting must never alter robot control.
+            LOG.warning("%s: progress callback failed: %s", robot_name, exc)
 
     def _wait_for(
         self,
@@ -899,15 +910,29 @@ class DualRobotController:
         )
 
     def _startup_one(self, robot: RobotConfig, client: OrsusClient) -> dict[str, Any]:
+        self._emit_progress(robot.name, "preflight", "started")
         preflight = self._preflight_one(robot, client, require_mission=False)
+        self._emit_progress(robot.name, "preflight", "completed")
         LOG.info("%s: starting motion adapter", robot.name)
+        self._emit_progress(robot.name, "motion", "started")
         motion = self._ensure_motion(robot, client)
+        self._emit_progress(robot.name, "motion", "completed")
         LOG.info("%s: starting scan services", robot.name)
+        self._emit_progress(robot.name, "scan", "started")
         scan = self._ensure_scan(robot, client)
+        self._emit_progress(robot.name, "scan", "completed")
         LOG.info("%s: starting navigation container", robot.name)
+        self._emit_progress(robot.name, "navigation_container", "started")
         nav_container = self._ensure_nav_container(robot, client)
+        self._emit_progress(robot.name, "navigation_container", "completed")
         client.enable_relocalization()
         LOG.info("%s: running %s global relocalization", robot.name, robot.relocalization_mode)
+        self._emit_progress(
+            robot.name,
+            "relocalization",
+            "started",
+            mode=robot.relocalization_mode,
+        )
         with self._active_lock:
             self._active_relocalizations.add(robot.name)
         try:
@@ -923,6 +948,7 @@ class DualRobotController:
                 self._active_relocalizations.discard(robot.name)
         if self.stop_event.is_set():
             raise InterruptedError(f"{robot.name}: interrupted after global relocalization")
+        self._emit_progress(robot.name, "relocalization", "completed")
         navigation = client.navigation_status()
         motion_after_relocalization = client.motion_status()
         motion_ready, motion_reason = _motion_ready(
@@ -949,6 +975,7 @@ class DualRobotController:
 
     def _track_mission(self, robot: RobotConfig, client: OrsusClient, mission_id: str) -> dict[str, Any]:
         started = time.monotonic()
+        last_status: Optional[str] = None
         while True:
             if self.stop_event.is_set():
                 raise InterruptedError(f"{robot.name}: mission monitoring interrupted")
@@ -957,6 +984,14 @@ class DualRobotController:
                 raise InterruptedError(f"{robot.name}: mission monitoring interrupted")
             status = str(status_data.get("status", "unknown")).lower()
             self.state.update(robot.name, mission_id=mission_id, status=status)
+            if status != last_status:
+                self._emit_progress(
+                    robot.name,
+                    "mission",
+                    status,
+                    mission_id=mission_id,
+                )
+                last_status = status
             if status in TERMINAL_MISSION_STATES:
                 with self._active_lock:
                     self._active_missions.pop(robot.name, None)
@@ -1005,6 +1040,7 @@ class DualRobotController:
             raise InterruptedError(f"{robot.name}: interrupted before mission submission")
         mission = normalize_mission(robot.mission, f"robots.{robot.name}.mission")
         LOG.info("%s: submitting %s mission", robot.name, mission["mode"])
+        self._emit_progress(robot.name, "mission_submission", "started", mode=mission["mode"])
         try:
             submitted = client.submit_mission(mission)
         except TransportError as exc:
@@ -1029,12 +1065,36 @@ class DualRobotController:
         with self._active_lock:
             self._active_missions[robot.name] = mission_id
         self.state.update(robot.name, mission_id=mission_id, status=submitted.get("status", "pending"))
+        self._emit_progress(
+            robot.name,
+            "mission_submission",
+            "completed",
+            mission_id=mission_id,
+        )
         result = self._track_mission(robot, client, mission_id)
         result["startup"] = startup
         return result
 
     def run(self) -> dict[str, Any]:
         return self._parallel(self._run_one)
+
+    def resume_mission(self, mission_id: str) -> dict[str, Any]:
+        if len(self.robots) != 1:
+            raise ConfigError("resume_mission requires exactly one selected robot")
+
+        def one(robot: RobotConfig, client: OrsusClient) -> dict[str, Any]:
+            with self._active_lock:
+                self._active_missions[robot.name] = mission_id
+            self.state.update(robot.name, mission_id=mission_id, status="recovering")
+            self._emit_progress(
+                robot.name,
+                "mission",
+                "recovering",
+                mission_id=mission_id,
+            )
+            return self._track_mission(robot, client, mission_id)
+
+        return self._parallel(one)
 
     def status(self) -> dict[str, Any]:
         def one(robot: RobotConfig, client: OrsusClient) -> dict[str, Any]:

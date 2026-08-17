@@ -6,6 +6,7 @@ registry_source="${2:-}"
 source_root=/opt/m4t-relay-source
 app_root=/opt/m4t-relay
 state_root=/var/lib/m4t-relay
+requirements_file="$source_root/requirements.txt"
 env_file=/etc/m4t-relay.env
 registry_file=/etc/m4t-relay-devices.json
 
@@ -21,13 +22,17 @@ fi
 install -d -m 755 -o root -g root "$source_root" "$app_root" "$app_root/communication_test"
 install -d -m 750 -o m4trelay -g m4trelay "$state_root"
 tar -xzf "$archive" -C "$source_root"
+if [[ ! -f "$requirements_file" ]]; then
+    printf 'Requirements file not found in deployment archive: %s\n' "$requirements_file" >&2
+    exit 1
+fi
 cp -a "$source_root/communication_test/." "$app_root/communication_test/"
 
 if [[ ! -x "$app_root/venv/bin/python" ]]; then
     python3 -m venv "$app_root/venv"
 fi
 "$app_root/venv/bin/pip" install --disable-pip-version-check \
-    -r "$app_root/communication_test/cloud/requirements.txt"
+    -r "$requirements_file"
 
 if [[ ! -f "$env_file" ]]; then
     umask 077

@@ -1,0 +1,7 @@
+{
+  "base_url": "http://120.24.74.70",
+  "device_id": "M4T-001",
+  "device_token": "2b12eaed0b195a43f61fe8fcd65c1025ce44c0fd6c2a41ecca7ba8c63377eca7",
+  "poll_timeout_seconds": 25,
+  "heartbeat_interval_seconds": 5
+}

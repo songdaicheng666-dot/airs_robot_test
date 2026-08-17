@@ -12,6 +12,18 @@ DEVICE_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 DEVICE_KINDS = {"m4t", "orsus"}
 
 
+def env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be a boolean value")
+
+
 @dataclass(frozen=True)
 class DeviceSettings:
     device_id: str
@@ -66,6 +78,7 @@ class Settings:
     command_lease_seconds: int = 35
     command_ttl_seconds: int = 300
     max_poll_seconds: int = 30
+    allow_insecure_navigation: bool = False
     devices: dict[str, DeviceSettings] = field(default_factory=dict)
 
     @classmethod
@@ -75,7 +88,7 @@ class Settings:
         )
         devices = load_device_registry(Path(registry_path)) if registry_path else {}
         settings = cls(
-            database_path=Path(os.environ.get("M4T_DATABASE_PATH", "communication_test/data/relay.db")),
+            database_path=Path(os.environ.get("M4T_DATABASE_PATH", "/var/lib/m4t-relay/relay.db")),
             operator_token=os.environ.get("M4T_OPERATOR_TOKEN", ""),
             device_token=os.environ.get("M4T_DEVICE_TOKEN", ""),
             device_id=os.environ.get("M4T_DEVICE_ID", "M4T-001"),
@@ -83,6 +96,7 @@ class Settings:
             command_lease_seconds=int(os.environ.get("M4T_COMMAND_LEASE_SECONDS", "35")),
             command_ttl_seconds=int(os.environ.get("M4T_COMMAND_TTL_SECONDS", "300")),
             max_poll_seconds=int(os.environ.get("M4T_MAX_POLL_SECONDS", "30")),
+            allow_insecure_navigation=env_flag("M4T_ALLOW_INSECURE_NAVIGATION"),
             devices=devices,
         )
         settings.validate()

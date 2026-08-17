@@ -1625,7 +1625,7 @@ communication_test/deploy/orsus/
 Agent 主动向 ECS 发起 25 秒长轮询并每 5 秒上报状态，因此不需要给 Orsus 配置公网 IP、端口
 映射或入站安全组规则。
 
-当前唯一允许的命令为：
+基础联通测试允许的命令为：
 
 ```text
 PING
@@ -1636,8 +1636,9 @@ STATUS_QUERY
 ECS 的实际路由。各状态接口独立容错；导航容器停止导致状态查询返回 HTTP 500 时，Agent 仍会
 正常上报其他字段。
 
-Agent 不包含 `/services/motion/start`、`/nav/missions`、暂停、恢复、取消或其他运动写接口，
-本轮公网 HTTP 验证不会启动或移动 Go2。
+新版 Agent 还可在三端安全门禁全部通过后处理 `NAVIGATE` 和 `CANCEL_NAVIGATION`，复用
+`orsus_nav.py` 的 motion/scan/nav 启动、全局重定位、任务监控和停止确认。基础 PING/STATUS_QUERY
+验证本身仍不会启动或移动 Go2；完整部署与短距离验收必须按 `navigation_test/README.md` 执行。
 
 ### 6.3 服务检查
 
@@ -1653,4 +1654,4 @@ Agent 的私密配置是 `/etc/orsus-ecs-agent.env`，其中设备 ID 固定为
 `ORSUS-GO2-GSM20260003`，设备 Token 必须与 ECS `/etc/m4t-relay-devices.json` 中该设备的
 Token 一致。配置文件和日志不得复制到仓库或对外发送。
 
-完整的 ECS 升级、Agent 安装、CLI 验证和回滚步骤见 `communication_test/README.md` 第 10 节。
+完整的 ECS 升级、Agent 安装、导航 CLI、指标报告和回滚步骤见 `navigation_test/README.md`。

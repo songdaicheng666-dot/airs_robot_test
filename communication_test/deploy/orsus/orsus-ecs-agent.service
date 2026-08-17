@@ -1,5 +1,5 @@
 [Unit]
-Description=Go2 Orsus ECS relay agent
+Description=Orsus ECS relay and navigation agent
 After=network-online.target robot-sport.service
 Wants=network-online.target
 
@@ -13,6 +13,8 @@ Environment=PYTHONUNBUFFERED=1
 ExecStart=/usr/bin/python3 /opt/orsus-ecs-agent/agent.py
 Restart=on-failure
 RestartSec=5
+StateDirectory=orsus-ecs-agent
+StateDirectoryMode=0750
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true

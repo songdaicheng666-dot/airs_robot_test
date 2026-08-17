@@ -370,6 +370,29 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(persisted["robots"]["scout"]["mission_id"], "mission-scout")
         self.assertEqual(persisted["robots"]["scout"]["status"], "completed")
 
+    def test_progress_callback_reports_phases_and_resume_does_not_resubmit(self) -> None:
+        mission = {"mode": "standard", "target": {"x": 1, "y": 2, "theta": 0}}
+        go2 = robot_config("go2", mission=mission)
+        client = StubClient(go2)
+        client.mission_states = ["running", "completed"]
+        events: list[tuple[str, dict[str, Any]]] = []
+        controller = DualRobotController(
+            self.app_config([go2]),
+            [go2],
+            clients={"go2": client},
+            progress_callback=lambda name, event: events.append((name, event)),
+        )
+
+        report = controller.resume_mission("mission-existing")
+
+        self.assertTrue(report["ok"])
+        self.assertEqual(client.submit_count, 0)
+        self.assertIn(
+            ("go2", {"phase": "mission", "status": "recovering", "mission_id": "mission-existing"}),
+            events,
+        )
+        self.assertEqual(events[-1][1]["status"], "completed")
+
     def test_failed_mission_marks_robot_failed(self) -> None:
         mission = {"mode": "direct", "target": {"x": 1, "y": 0, "theta": 0}}
         go2 = robot_config("go2", mission=mission)

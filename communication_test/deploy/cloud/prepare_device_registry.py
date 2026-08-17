@@ -80,11 +80,54 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--orsus-env-output", type=Path)
     parser.add_argument("--orsus-device-id", default="ORSUS-GO2-GSM20260003")
     parser.add_argument("--orsus-sn", default="GSM20260003")
+    parser.add_argument("--scout-token-file", type=Path)
+    parser.add_argument("--scout-env-output", type=Path)
+    parser.add_argument("--scout-device-id", default="ORSUS-SCOUT-GSP20250002")
+    parser.add_argument("--scout-sn", default="GSP20250002")
     return parser
+
+
+def agent_environment(
+    *,
+    device_id: str,
+    token: str,
+    sn: str,
+    robot_name: str,
+    adapter_type: str,
+    scene_name: str,
+    bringup_mode: str,
+    network_interface: str,
+) -> str:
+    return "\n".join(
+        [
+            "RELAY_BASE_URL=http://120.24.74.70",
+            f"RELAY_DEVICE_ID={device_id}",
+            f"RELAY_DEVICE_TOKEN={token}",
+            f"ORSUS_EXPECTED_SN={sn}",
+            "ORSUS_BASE_URL=http://127.0.0.1:8898",
+            f"ORSUS_NETWORK_INTERFACE={network_interface}",
+            f"ORSUS_ROBOT_NAME={robot_name}",
+            f"ORSUS_ADAPTER_TYPE={adapter_type}",
+            f"ORSUS_SCENE_NAME={scene_name}",
+            f"ORSUS_BRINGUP_MODE={bringup_mode}",
+            "ORSUS_RELOCALIZATION_MODE=sequential",
+            "ORSUS_NAVIGATION_STATE_PATH=/var/lib/orsus-ecs-agent/navigation-job.json",
+            "RELAY_HEARTBEAT_SECONDS=5",
+            "RELAY_POLL_SECONDS=25",
+            "RELAY_COMMAND_RENEWAL_SECONDS=10",
+            "RELAY_CONNECT_TIMEOUT_SECONDS=3",
+            "RELAY_READ_TIMEOUT_SECONDS=8",
+            "RELAY_ALLOW_INSECURE_HTTP=false",
+            "LOG_LEVEL=INFO",
+            "",
+        ]
+    )
 
 
 def main() -> int:
     args = build_parser().parse_args()
+    if args.scout_env_output and not args.scout_token_file:
+        raise ValueError("--scout-env-output requires --scout-token-file")
     environment = read_env(args.env_file)
     m4t_token = validate_token("M4T_DEVICE_TOKEN", environment.get("M4T_DEVICE_TOKEN", ""))
     orsus_token = validate_token(
@@ -101,30 +144,54 @@ def main() -> int:
             "expected_sn": args.orsus_sn,
         },
     }
+    scout_token = None
+    if args.scout_token_file:
+        scout_token = validate_token(
+            "Scout device token",
+            args.scout_token_file.read_text(encoding="utf-8").strip(),
+        )
+        if scout_token in {m4t_token, orsus_token}:
+            raise ValueError("M4T, Go2, and Scout device tokens must all be different")
+        registry[args.scout_device_id] = {
+            "kind": "orsus",
+            "token": scout_token,
+            "expected_sn": args.scout_sn,
+        }
     write_private_json(args.output, registry)
     if args.orsus_env_output:
         write_private_text(
             args.orsus_env_output,
-            "\n".join(
-                [
-                    "RELAY_BASE_URL=http://120.24.74.70",
-                    f"RELAY_DEVICE_ID={args.orsus_device_id}",
-                    f"RELAY_DEVICE_TOKEN={orsus_token}",
-                    f"ORSUS_EXPECTED_SN={args.orsus_sn}",
-                    "ORSUS_BASE_URL=http://127.0.0.1:8898",
-                    "ORSUS_NETWORK_INTERFACE=eth3",
-                    "RELAY_HEARTBEAT_SECONDS=5",
-                    "RELAY_POLL_SECONDS=25",
-                    "RELAY_CONNECT_TIMEOUT_SECONDS=3",
-                    "RELAY_READ_TIMEOUT_SECONDS=8",
-                    "LOG_LEVEL=INFO",
-                    "",
-                ]
+            agent_environment(
+                device_id=args.orsus_device_id,
+                token=orsus_token,
+                sn=args.orsus_sn,
+                robot_name="go2",
+                adapter_type="go2",
+                scene_name="airs1f_3",
+                bringup_mode="localization",
+                network_interface="eth3",
+            ),
+        )
+    if args.scout_env_output:
+        assert scout_token is not None
+        write_private_text(
+            args.scout_env_output,
+            agent_environment(
+                device_id=args.scout_device_id,
+                token=scout_token,
+                sn=args.scout_sn,
+                robot_name="scout",
+                adapter_type="scout",
+                scene_name="airs_inter",
+                bringup_mode="navigation",
+                network_interface="CHANGE_ME",
             ),
         )
     print(f"wrote private registry for {len(registry)} devices to {args.output}")
     if args.orsus_env_output:
         print(f"wrote private Orsus environment to {args.orsus_env_output}")
+    if args.scout_env_output:
+        print(f"wrote private Scout environment to {args.scout_env_output}")
     return 0
 
 

@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import json
 import subprocess
+import threading
+import time
+from datetime import datetime, timezone
 from typing import Any, Callable
 
 import pytest
@@ -202,3 +205,297 @@ def test_cloud_error_does_not_expose_authorization_token() -> None:
 def test_rejects_short_device_token() -> None:
     with pytest.raises(Exception, match="at least 32"):
         OrsusAgent(settings(device_token="too-short"))
+
+
+class FakeNavigationController:
+    def __init__(self, _config: Any, selected: list[Any], *, progress_callback: Callable[..., None]):
+        self.robot_name = selected[0].name
+        self.progress_callback = progress_callback
+        self.stop_event = threading.Event()
+        self.closed = False
+        self.resume_ids: list[str] = []
+
+    def run(self) -> dict[str, Any]:
+        self.progress_callback(self.robot_name, {"phase": "preflight", "status": "started"})
+        self.progress_callback(self.robot_name, {"phase": "preflight", "status": "completed"})
+        self.progress_callback(
+            self.robot_name,
+            {"phase": "mission_submission", "status": "completed", "mission_id": "mission-1"},
+        )
+        self.progress_callback(
+            self.robot_name,
+            {"phase": "mission", "status": "completed", "mission_id": "mission-1"},
+        )
+        return {
+            "ok": True,
+            "robots": {
+                self.robot_name: {
+                    "ok": True,
+                    "data": {"success": True, "status": "completed", "mission_id": "mission-1"},
+                }
+            },
+        }
+
+    def resume_mission(self, mission_id: str) -> dict[str, Any]:
+        self.resume_ids.append(mission_id)
+        return self.run()
+
+    def cancel_active_operations(self, *, stop_navigation: bool = False) -> dict[str, Any]:
+        self.stop_event.set()
+        return {"ok": stop_navigation, "missions": {}, "relocalizations": {}}
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class BlockingNavigationController(FakeNavigationController):
+    def __init__(self, *args: Any, **kwargs: Any):
+        super().__init__(*args, **kwargs)
+        self.release = threading.Event()
+
+    def run(self) -> dict[str, Any]:
+        self.progress_callback(self.robot_name, {"phase": "mission", "status": "running", "mission_id": "m"})
+        self.release.wait(2)
+        return {
+            "ok": False,
+            "robots": {self.robot_name: {"ok": False, "error": "interrupted"}},
+        }
+
+    def cancel_active_operations(self, *, stop_navigation: bool = False) -> dict[str, Any]:
+        self.stop_event.set()
+        self.release.set()
+        return {"ok": stop_navigation, "missions": {}, "relocalizations": {}}
+
+
+def navigation_cloud_handler(state_updates: list[tuple[str, dict[str, Any]]]):
+    def handler(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        if url.endswith("/v1/time"):
+            return FakeResponse(
+                {
+                    "server_time": datetime.now(tz=timezone.utc).isoformat(),
+                    "unix_time_ns": time.time_ns(),
+                }
+            )
+        if "/state" in url:
+            command_id = url.split("/commands/", 1)[1].split("/", 1)[0]
+            state_updates.append((command_id, kwargs["json"]))
+            return FakeResponse({"state": kwargs["json"]["state"]})
+        raise AssertionError(f"unexpected cloud request: {method} {url}")
+
+    return handler
+
+
+def navigation_command(command_id: str = "nav-command") -> dict[str, Any]:
+    return {
+        "command_id": command_id,
+        "client_request_id": "request-1",
+        "created_at": datetime.now(tz=timezone.utc).isoformat(),
+        "type": "NAVIGATE",
+        "payload": {"target": {"x": 1.0, "y": 2.0, "theta": 0.5}},
+    }
+
+
+def test_navigation_runs_in_background_and_reports_completed(tmp_path: Any) -> None:
+    updates: list[tuple[str, dict[str, Any]]] = []
+    agent = OrsusAgent(
+        settings(
+            allow_insecure_http=True,
+            navigation_state_path=tmp_path / "navigation.json",
+        ),
+        cloud_session=FakeSession(navigation_cloud_handler(updates)),
+        local_session=FakeSession(local_handler()),
+        command_runner=ip_runner,
+        controller_factory=FakeNavigationController,
+    )
+
+    agent.execute_command(navigation_command())
+    assert agent.navigation_thread is not None
+    agent.navigation_thread.join(timeout=3)
+
+    states = [payload["state"] for command_id, payload in updates if command_id == "nav-command"]
+    assert states[0] == "RECEIVED"
+    assert "RUNNING" in states
+    assert states[-1] == "COMPLETED"
+    result = updates[-1][1]["result"]
+    assert result["status"] == "completed"
+    assert result["mission_id"] == "mission-1"
+    persisted = json.loads((tmp_path / "navigation.json").read_text(encoding="utf-8"))
+    assert persisted["terminal_acknowledged"] is True
+
+
+def test_terminal_result_is_bounded_without_losing_summary_fields() -> None:
+    result = {
+        "status": "completed",
+        "mission_id": "mission-large",
+        "target": {"x": 1.0, "y": 2.0, "theta": 0.5},
+        "timing": {
+            "total_seconds": 12.5,
+            "phase_seconds": {"startup": 1.0, "relocalization": 2.0, "mission": 9.5},
+        },
+        "network_metrics": {
+            "sample_count": 200,
+            "success_count": 199,
+            "failure_count": 1,
+            "rtt_ms": {"min": 1.0, "avg": 2.0, "p50": 2.0, "p95": 3.0, "p99": 4.0},
+            "samples": [
+                {
+                    "recorded_at": "2026-08-17T00:00:00Z",
+                    "method": "POST",
+                    "path": f"/v1/commands/{index}/state/" + ("x" * 512),
+                    "rtt_ms": 2.0,
+                    "success": True,
+                }
+                for index in range(200)
+            ],
+            "samples_truncated": 0,
+        },
+        "navigation_report": {
+            "ok": True,
+            "robots": {
+                "go2": {
+                    "ok": True,
+                    "data": {
+                        "status": "completed",
+                        "mission_id": "mission-large",
+                        "diagnostics": "x" * 100_000,
+                    },
+                }
+            },
+        },
+    }
+
+    bounded = OrsusAgent._bounded_terminal_result(result)
+
+    encoded = json.dumps(bounded, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    assert len(encoded) <= 48 * 1024
+    assert bounded["status"] == "completed"
+    assert bounded["mission_id"] == "mission-large"
+    assert bounded["target"] == {"x": 1.0, "y": 2.0, "theta": 0.5}
+    assert bounded["timing"]["phase_seconds"]["mission"] == 9.5
+    assert bounded["network_metrics"]["rtt_ms"]["p95"] == 3.0
+    assert len(bounded["network_metrics"]["samples"]) == 32
+    assert bounded["network_metrics"]["samples_truncated"] == 168
+    assert bounded["navigation_report"] == {
+        "ok": True,
+        "robots": {
+            "go2": {
+                "ok": True,
+                "error": None,
+                "status": "completed",
+                "mission_id": "mission-large",
+            }
+        },
+        "truncated": True,
+    }
+    assert bounded["result_truncated"] is True
+
+
+def test_navigation_rejects_insecure_http_and_wrong_route(tmp_path: Any) -> None:
+    updates: list[tuple[str, dict[str, Any]]] = []
+    agent = OrsusAgent(
+        settings(navigation_state_path=tmp_path / "navigation.json"),
+        cloud_session=FakeSession(navigation_cloud_handler(updates)),
+        local_session=FakeSession(local_handler()),
+        command_runner=ip_runner,
+        controller_factory=FakeNavigationController,
+    )
+    agent.execute_command(navigation_command("insecure"))
+    assert updates[-1][1]["state"] == "FAILED"
+    assert "insecure" in updates[-1][1]["error"]
+
+    def wrong_route(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        result = ip_runner(command, **kwargs)
+        if "route" in command:
+            value = json.loads(result.stdout)
+            value[0]["dev"] = "wlan0"
+            return subprocess.CompletedProcess(command, 0, json.dumps(value), "")
+        return result
+
+    updates.clear()
+    routed = OrsusAgent(
+        settings(
+            allow_insecure_http=True,
+            navigation_state_path=tmp_path / "wrong-route.json",
+        ),
+        cloud_session=FakeSession(navigation_cloud_handler(updates)),
+        local_session=FakeSession(local_handler()),
+        command_runner=wrong_route,
+        controller_factory=FakeNavigationController,
+    )
+    routed.execute_command(navigation_command("wrong-route"))
+    assert updates[-1][1]["state"] == "FAILED"
+    assert "does not use configured 5G interface" in updates[-1][1]["error"]
+
+
+def test_cancel_navigation_stops_active_controller(tmp_path: Any) -> None:
+    updates: list[tuple[str, dict[str, Any]]] = []
+    agent = OrsusAgent(
+        settings(
+            allow_insecure_http=True,
+            navigation_state_path=tmp_path / "navigation.json",
+        ),
+        cloud_session=FakeSession(navigation_cloud_handler(updates)),
+        local_session=FakeSession(local_handler()),
+        command_runner=ip_runner,
+        controller_factory=BlockingNavigationController,
+    )
+    agent.execute_command(navigation_command())
+    agent.execute_command(
+        {
+            "command_id": "cancel-command",
+            "type": "CANCEL_NAVIGATION",
+            "payload": {"navigation_command_id": "nav-command"},
+        }
+    )
+    assert agent.navigation_thread is not None
+    agent.navigation_thread.join(timeout=3)
+
+    cancel_states = [payload["state"] for cid, payload in updates if cid == "cancel-command"]
+    nav_states = [payload["state"] for cid, payload in updates if cid == "nav-command"]
+    assert cancel_states == ["RECEIVED", "COMPLETED"]
+    assert nav_states[-1] == "CANCELLED"
+
+
+def test_recovery_resumes_known_mission_without_submission(tmp_path: Any) -> None:
+    updates: list[tuple[str, dict[str, Any]]] = []
+    state_path = tmp_path / "navigation.json"
+    now = datetime.now(tz=timezone.utc).isoformat().replace("+00:00", "Z")
+    state_path.write_text(
+        json.dumps(
+            {
+                "command_id": "nav-command",
+                "target": {"x": 1.0, "y": 2.0, "theta": 0.5},
+                "status": "running",
+                "phase": "mission",
+                "phase_status": "running",
+                "mission_id": "mission-existing",
+                "started_at": now,
+                "updated_at": now,
+                "phase_events": [],
+                "terminal_acknowledged": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+    controllers: list[FakeNavigationController] = []
+
+    def factory(*args: Any, **kwargs: Any) -> FakeNavigationController:
+        controller = FakeNavigationController(*args, **kwargs)
+        controllers.append(controller)
+        return controller
+
+    agent = OrsusAgent(
+        settings(
+            allow_insecure_http=True,
+            navigation_state_path=state_path,
+        ),
+        cloud_session=FakeSession(navigation_cloud_handler(updates)),
+        local_session=FakeSession(local_handler()),
+        command_runner=ip_runner,
+        controller_factory=factory,
+    )
+    agent.recover_navigation()
+    assert agent.navigation_thread is not None
+    agent.navigation_thread.join(timeout=3)
+    assert controllers[0].resume_ids == ["mission-existing"]
+    assert updates[-1][1]["state"] == "COMPLETED"
