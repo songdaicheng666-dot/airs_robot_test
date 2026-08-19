@@ -6,6 +6,7 @@ __pycache__/
 /LoRA/
 /model+sft/
 navigation_test/results/
+startup_test/results/
 communication_test/*.env
 communication_test/.private/
 airsback

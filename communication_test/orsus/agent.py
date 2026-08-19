@@ -29,7 +29,7 @@ import requests
 from orsus_nav import AppConfig, DualRobotController, HttpSettings, RobotConfig
 
 
-VERSION = "2.0.0"
+VERSION = "2.4.0"
 LOG = logging.getLogger("orsus_ecs_agent")
 DEVICE_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 
@@ -105,6 +105,7 @@ class Settings:
     bringup_mode: str = "localization"
     relocalization_mode: str = "sequential"
     navigation_state_path: Path = Path("/var/lib/orsus-ecs-agent/navigation-job.json")
+    startup_state_path: Path | None = None
     command_renewal_seconds: float = 10.0
     allow_insecure_http: bool = False
 
@@ -149,6 +150,11 @@ class Settings:
                     "/var/lib/orsus-ecs-agent/navigation-job.json",
                 )
             ),
+            startup_state_path=(
+                Path(os.environ["ORSUS_STARTUP_STATE_PATH"])
+                if os.environ.get("ORSUS_STARTUP_STATE_PATH")
+                else None
+            ),
             command_renewal_seconds=positive_number(
                 "RELAY_COMMAND_RENEWAL_SECONDS",
                 os.environ.get("RELAY_COMMAND_RENEWAL_SECONDS", "10"),
@@ -192,6 +198,10 @@ class Settings:
             raise ConfigError("ORSUS_RELOCALIZATION_MODE is invalid")
         if self.command_renewal_seconds <= 0 or self.command_renewal_seconds > 30:
             raise ConfigError("RELAY_COMMAND_RENEWAL_SECONDS must be greater than zero and no more than 30")
+
+    @property
+    def resolved_startup_state_path(self) -> Path:
+        return self.startup_state_path or self.navigation_state_path.with_name("startup-ready.json")
 
 
 class OrsusAgent:
@@ -447,13 +457,13 @@ class OrsusAgent:
             raise ConfigError(f"invalid navigation state in {path}")
         return value
 
-    def _save_job(self, job: dict[str, Any]) -> None:
-        path = self.settings.navigation_state_path
+    @staticmethod
+    def _write_state(path: Path, value: dict[str, Any], label: str) -> None:
         temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             temporary.write_text(
-                json.dumps(job, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+                json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
                 encoding="utf-8",
             )
             os.chmod(temporary, 0o600)
@@ -463,7 +473,124 @@ class OrsusAgent:
                 temporary.unlink(missing_ok=True)
             except OSError:
                 pass
-            raise ConfigError(f"could not persist navigation state {path}: {exc}") from exc
+            raise ConfigError(f"could not persist {label} state {path}: {exc}") from exc
+
+    def _save_job(self, job: dict[str, Any]) -> None:
+        self._write_state(self.settings.navigation_state_path, job, "navigation")
+
+    @staticmethod
+    def _boot_id() -> str:
+        path = Path("/proc/sys/kernel/random/boot_id")
+        try:
+            value = path.read_text(encoding="ascii").strip()
+        except OSError as exc:
+            raise ConfigError(f"could not read system boot ID: {exc}") from exc
+        if not value:
+            raise ConfigError("system boot ID is empty")
+        return value
+
+    def _load_startup_state(self) -> dict[str, Any] | None:
+        path = self.settings.resolved_startup_state_path
+        if not path.exists():
+            return None
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ConfigError(f"could not read startup state {path}: {exc}") from exc
+        if not isinstance(value, dict):
+            raise ConfigError(f"invalid startup state in {path}")
+        return value
+
+    def _save_startup_state(self, value: dict[str, Any]) -> None:
+        self._write_state(self.settings.resolved_startup_state_path, value, "startup")
+
+    def _invalidate_startup_state(self, reason: str) -> None:
+        self._save_startup_state(
+            {
+                "schema_version": 1,
+                "status": "not_ready",
+                "boot_id": self._boot_id(),
+                "invalidated_at": utc_now(),
+                "reason": reason[:1024],
+            }
+        )
+
+    def _record_startup_ready(
+        self,
+        job: dict[str, Any],
+        result: dict[str, Any],
+        report: dict[str, Any],
+    ) -> None:
+        robot_result = report.get("robots", {}).get(self.settings.robot_name, {})
+        data = robot_result.get("data") if isinstance(robot_result, dict) else {}
+        data = data if isinstance(data, dict) else {}
+        nav_container = data.get("nav_container")
+        nav_container = nav_container if isinstance(nav_container, dict) else {}
+        localization = result.get("localization")
+        localization = localization if isinstance(localization, dict) else {}
+        self._save_startup_state(
+            {
+                "schema_version": 1,
+                "status": "ready",
+                "command_id": job.get("command_id"),
+                "completed_at": result.get("timing", {}).get("completed_at"),
+                "boot_id": self._boot_id(),
+                "device_id": self.settings.device_id,
+                "expected_sn": self.settings.expected_sn,
+                "robot_name": self.settings.robot_name,
+                "adapter_type": self.settings.adapter_type,
+                "scene_name": self.settings.scene_name,
+                "bringup_mode": self.settings.bringup_mode,
+                "container_id": nav_container.get("container_id"),
+                "localization": localization,
+            }
+        )
+
+    def _require_startup_ready(self) -> dict[str, Any]:
+        state = self._load_startup_state()
+        if state is None or state.get("status") != "ready":
+            reason = state.get("reason") if isinstance(state, dict) else None
+            suffix = f"; last state: {reason}" if reason else ""
+            raise ConfigError(f"successful STARTUP is required before NAVIGATE{suffix}")
+        if state.get("boot_id") != self._boot_id():
+            self._invalidate_startup_state("device rebooted after the last successful STARTUP")
+            raise ConfigError("successful STARTUP is required after the device reboot")
+        localization = state.get("localization")
+        pose = localization.get("pose") if isinstance(localization, dict) else None
+        if (
+            not isinstance(localization, dict)
+            or localization.get("status") != "successful"
+            or not isinstance(pose, dict)
+        ):
+            self._invalidate_startup_state("saved STARTUP localization is incomplete")
+            raise ConfigError("successful STARTUP with a localization pose is required before NAVIGATE")
+        expected = {
+            "device_id": self.settings.device_id,
+            "expected_sn": self.settings.expected_sn,
+            "robot_name": self.settings.robot_name,
+            "adapter_type": self.settings.adapter_type,
+            "scene_name": self.settings.scene_name,
+            "bringup_mode": self.settings.bringup_mode,
+        }
+        mismatches = [
+            f"{name}={state.get(name)!r} (expected {value!r})"
+            for name, value in expected.items()
+            if state.get(name) != value
+        ]
+        if mismatches:
+            self._invalidate_startup_state("robot profile changed after STARTUP")
+            raise ConfigError(
+                "successful STARTUP is required for the current robot profile; "
+                + ", ".join(mismatches)
+            )
+        return {
+            "command_id": state.get("command_id"),
+            "completed_at": state.get("completed_at"),
+            "boot_id": state.get("boot_id"),
+            "scene_name": state.get("scene_name"),
+            "container_id": state.get("container_id"),
+            "localization": state.get("localization"),
+        }
 
     def _job_metric_snapshot(self, started_at: str) -> dict[str, Any]:
         with self.metrics_lock:
@@ -526,8 +653,12 @@ class OrsusAgent:
             "sample_count": len(samples),
         }
 
-    def _robot_config(self, target: dict[str, float]) -> tuple[AppConfig, RobotConfig]:
-        mission = {"mode": "standard", "frame_id": "map", "target": dict(target)}
+    def _robot_config(self, target: dict[str, float] | None) -> tuple[AppConfig, RobotConfig]:
+        mission = (
+            {"mode": "standard", "frame_id": "map", "target": dict(target)}
+            if target is not None
+            else None
+        )
         robot = RobotConfig(
             name=self.settings.robot_name,
             enabled=True,
@@ -669,7 +800,7 @@ class OrsusAgent:
             payload=payload,
         )
 
-    def _create_controller(self, target: dict[str, float]) -> DualRobotController:
+    def _create_controller(self, target: dict[str, float] | None) -> DualRobotController:
         config, robot = self._robot_config(target)
         return self.controller_factory(
             config,
@@ -688,6 +819,13 @@ class OrsusAgent:
             job["phase_status"] = event.get("status", "running")
             if event.get("mission_id"):
                 job["mission_id"] = str(event["mission_id"])
+            if (
+                job.get("command_type") == "NAVIGATE"
+                and event.get("phase") == "relocalization"
+                and event.get("status") == "completed"
+                and isinstance(event.get("localization"), dict)
+            ):
+                job["navigation_localization"] = event["localization"]
             job.setdefault("phase_events", []).append({**event, "recorded_at": now})
             job["updated_at"] = now
             self._save_job(job)
@@ -706,6 +844,7 @@ class OrsusAgent:
     @staticmethod
     def _job_progress(job: dict[str, Any]) -> dict[str, Any]:
         return {
+            "operation": str(job.get("command_type", "NAVIGATE")).lower(),
             "phase": job.get("phase", "received"),
             "phase_status": job.get("phase_status", job.get("status", "received")),
             "mission_id": job.get("mission_id"),
@@ -730,6 +869,20 @@ class OrsusAgent:
                 durations[phase] = round((instant - starts[phase]).total_seconds(), 3)
         return durations
 
+    @staticmethod
+    def _successful_localization(value: Any) -> bool:
+        if not isinstance(value, dict) or value.get("status") != "successful":
+            return False
+        pose = value.get("pose")
+        if not isinstance(pose, dict):
+            return False
+        return all(
+            not isinstance(pose.get(name), bool)
+            and isinstance(pose.get(name), (int, float))
+            and math.isfinite(float(pose[name]))
+            for name in ("x", "y", "theta")
+        )
+
     def _terminal_result(self, job: dict[str, Any], report: dict[str, Any]) -> dict[str, Any]:
         completed_at = utc_now()
         started = datetime.fromisoformat(str(job["started_at"]).replace("Z", "+00:00"))
@@ -737,10 +890,15 @@ class OrsusAgent:
         robot_result = report.get("robots", {}).get(self.settings.robot_name, {})
         data = robot_result.get("data") if isinstance(robot_result, dict) else None
         data = data if isinstance(data, dict) else {}
+        command_type = str(job.get("command_type", "NAVIGATE"))
+        default_status = "ready" if command_type == "STARTUP" and report.get("ok") else (
+            "completed" if report.get("ok") else "failed"
+        )
         result = {
-            "status": data.get("status", "completed" if report.get("ok") else "failed"),
+            "operation": command_type.lower(),
+            "status": data.get("status", default_status),
             "mission_id": data.get("mission_id") or job.get("mission_id"),
-            "target": job["target"],
+            "target": job.get("target"),
             "robot": {
                 "name": self.settings.robot_name,
                 "device_id": self.settings.device_id,
@@ -761,8 +919,15 @@ class OrsusAgent:
             },
             "clock_calibration": job.get("clock_calibration"),
             "network_metrics": self._job_metric_snapshot(job["started_at"]),
-            "navigation_report": report,
         }
+        localization = data.get("localization")
+        if command_type == "NAVIGATE" and not isinstance(localization, dict):
+            localization = job.get("navigation_localization")
+        if isinstance(localization, dict):
+            result["localization"] = localization
+        if command_type != "STARTUP" and isinstance(job.get("startup_context"), dict):
+            result["startup_context"] = job["startup_context"]
+        result["startup_report" if command_type == "STARTUP" else "navigation_report"] = report
         return self._bounded_terminal_result(result)
 
     @staticmethod
@@ -778,9 +943,11 @@ class OrsusAgent:
         if len(json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) <= 48 * 1024:
             return result
 
-        compact_robots: dict[str, Any] = {}
-        report = result.get("navigation_report")
-        if isinstance(report, dict):
+        for report_key in ("navigation_report", "startup_report"):
+            compact_robots: dict[str, Any] = {}
+            report = result.get(report_key)
+            if not isinstance(report, dict):
+                continue
             for name, item in report.get("robots", {}).items():
                 if not isinstance(item, dict):
                     continue
@@ -791,7 +958,7 @@ class OrsusAgent:
                     "status": data.get("status"),
                     "mission_id": data.get("mission_id"),
                 }
-            result["navigation_report"] = {
+            result[report_key] = {
                 "ok": report.get("ok"),
                 "robots": compact_robots,
                 "truncated": True,
@@ -832,11 +999,22 @@ class OrsusAgent:
                 self._save_job(job)
 
             try:
-                report = (
-                    controller.resume_mission(resume_mission_id)
-                    if resume_mission_id is not None
-                    else controller.run()
-                )
+                if job.get("command_type") == "STARTUP":
+                    report = controller.startup()
+                elif resume_mission_id is not None:
+                    report = controller.resume_mission(resume_mission_id)
+                else:
+                    startup_context = job.get("startup_context")
+                    expected_container_id = (
+                        startup_context.get("container_id")
+                        if isinstance(startup_context, dict)
+                        else None
+                    )
+                    report = controller.navigate(
+                        expected_container_id=str(expected_container_id)
+                        if expected_container_id
+                        else None
+                    )
             except Exception as exc:
                 report = {
                     "ok": False,
@@ -861,19 +1039,67 @@ class OrsusAgent:
 
             result = self._terminal_result(job, report)
             with self.navigation_lock:
+                terminal_error: str | None = None
                 if job.get("cancel_requested"):
                     cancel_ok = bool(job.get("cancel_ok"))
                     terminal_state = "CANCELLED" if cancel_ok else "FAILED"
                     result["status"] = "cancelled" if cancel_ok else "cancel_failed"
                     result["cancellation"] = job.get("cancel_result")
                 else:
-                    terminal_state = "COMPLETED" if report.get("ok") and result["status"] == "completed" else "FAILED"
+                    if job.get("command_type") == "STARTUP":
+                        localization = result.get("localization")
+                        localization_ready = self._successful_localization(localization)
+                        terminal_state = (
+                            "COMPLETED"
+                            if report.get("ok")
+                            and result["status"] == "ready"
+                            and localization_ready
+                            else "FAILED"
+                        )
+                        if report.get("ok") and not localization_ready:
+                            result["status"] = "localization_missing"
+                            terminal_error = (
+                                "startup completed without a successful localization pose"
+                            )
+                    else:
+                        localization = result.get("localization")
+                        localization_ready = self._successful_localization(localization)
+                        terminal_state = (
+                            "COMPLETED"
+                            if report.get("ok")
+                            and result["status"] == "completed"
+                            and localization_ready
+                            else "FAILED"
+                        )
+                        if report.get("ok") and not localization_ready:
+                            result["status"] = "localization_missing"
+                            terminal_error = (
+                                "navigation completed without a fresh successful localization pose"
+                            )
+                if job.get("command_type") == "STARTUP":
+                    try:
+                        if terminal_state == "COMPLETED":
+                            self._record_startup_ready(job, result, report)
+                        else:
+                            self._invalidate_startup_state(
+                                terminal_error or self._navigation_error(report)
+                            )
+                    except ConfigError as exc:
+                        terminal_state = "FAILED"
+                        result["status"] = "startup_state_persistence_failed"
+                        terminal_error = str(exc)
+                if terminal_state == "FAILED":
+                    result["failed_phase"] = job.get("phase", "unknown")
                 job["terminal_state"] = terminal_state
                 job["status"] = terminal_state.lower()
                 job["phase"] = "finished"
                 job["phase_status"] = job["status"]
                 job["result"] = result
-                job["error"] = None if terminal_state in {"COMPLETED", "CANCELLED"} else self._navigation_error(report)
+                job["error"] = (
+                    None
+                    if terminal_state in {"COMPLETED", "CANCELLED"}
+                    else terminal_error or self._navigation_error(report)
+                )
                 job["terminal_recorded_at"] = result["timing"]["completed_at"]
                 job["terminal_acknowledged"] = False
                 self._save_job(job)
@@ -890,10 +1116,15 @@ class OrsusAgent:
         for result in report.get("robots", {}).values():
             if not result.get("ok"):
                 errors.append(str(result.get("error") or result.get("data", {}).get("status") or "failed"))
-        return "; ".join(errors)[:1024] or "navigation failed"
+        return "; ".join(errors)[:1024] or "operation failed"
 
-    def _begin_navigation(self, command: dict[str, Any], target: dict[str, float]) -> None:
+    def _begin_operation(
+        self,
+        command: dict[str, Any],
+        target: dict[str, float] | None,
+    ) -> None:
         command_id = str(command["command_id"])
+        command_type = str(command["type"])
         received_at = utc_now()
         with self.navigation_lock:
             if self.active_job is not None:
@@ -909,17 +1140,23 @@ class OrsusAgent:
                         )
                     return
                 raise ConfigError(
-                    f"navigation command {self.active_job['command_id']} is already active"
+                    f"startup or navigation command {self.active_job['command_id']} is already active"
                 )
 
         parsed = urlparse(self.settings.relay_base_url)
         if parsed.scheme != "https" and not self.settings.allow_insecure_http:
-            raise ConfigError("navigation over insecure relay HTTP is disabled")
+            raise ConfigError("robot startup and navigation over insecure relay HTTP are disabled")
         self.require_5g_route()
+        startup_context: dict[str, Any] | None = None
+        if command_type == "STARTUP":
+            self._invalidate_startup_state("STARTUP is in progress")
+        elif command_type == "NAVIGATE":
+            startup_context = self._require_startup_ready()
         self.post_state(command_id, "RECEIVED", device_recorded_at=received_at)
         controller = self._create_controller(target)
         job = {
             "command_id": command_id,
+            "command_type": command_type,
             "client_request_id": command.get("client_request_id"),
             "cloud_created_at": command.get("created_at"),
             "device_received_at": received_at,
@@ -933,6 +1170,8 @@ class OrsusAgent:
             "phase_events": [],
             "terminal_acknowledged": False,
         }
+        if startup_context is not None:
+            job["startup_context"] = startup_context
         with self.navigation_lock:
             self.active_job = job
             self.active_controller = controller
@@ -940,11 +1179,17 @@ class OrsusAgent:
         thread = threading.Thread(
             target=self._navigation_worker,
             args=(job, controller),
-            name=f"navigation-{command_id[:8]}",
+            name=f"{command_type.lower()}-{command_id[:8]}",
             daemon=True,
         )
         self.navigation_thread = thread
         thread.start()
+
+    def _begin_navigation(self, command: dict[str, Any], target: dict[str, float]) -> None:
+        self._begin_operation(command, target)
+
+    def _begin_startup(self, command: dict[str, Any]) -> None:
+        self._begin_operation(command, None)
 
     def _cancel_navigation(self, command_id: str, payload: dict[str, Any]) -> None:
         target_id = payload.get("navigation_command_id")
@@ -1011,6 +1256,7 @@ class OrsusAgent:
         job = self._load_job()
         if job is None or job.get("terminal_acknowledged"):
             return
+        job.setdefault("command_type", "NAVIGATE")
         with self.navigation_lock:
             self.active_job = job
         if job.get("terminal_state"):
@@ -1020,12 +1266,75 @@ class OrsusAgent:
                 LOG.warning("terminal navigation recovery upload failed: %s", exc)
             return
 
+        if job.get("command_type") == "STARTUP":
+            self._invalidate_startup_state("STARTUP recovery is in progress")
+            controller = self._create_controller(None)
+            with self.navigation_lock:
+                self.active_controller = controller
+                job["phase"] = "recovery"
+                job["phase_status"] = "recovering"
+                job["updated_at"] = utc_now()
+                self._save_job(job)
+            thread = threading.Thread(
+                target=self._navigation_worker,
+                args=(job, controller),
+                name=f"startup-recovery-{str(job['command_id'])[:8]}",
+                daemon=True,
+            )
+            self.navigation_thread = thread
+            thread.start()
+            return
+
         target = self._validated_target({"target": job.get("target")})
         controller = self._create_controller(target)
+        try:
+            startup_context = self._require_startup_ready()
+        except ConfigError as exc:
+            cleanup = controller.cancel_active_operations(stop_navigation=True)
+            result = self._terminal_result(job, {"ok": False, "robots": {}})
+            result["status"] = "startup_required_after_restart"
+            result["recovery_cleanup"] = cleanup
+            with self.navigation_lock:
+                job.update(
+                    {
+                        "terminal_state": "FAILED",
+                        "status": "failed",
+                        "phase": "recovery",
+                        "phase_status": "failed",
+                        "result": result,
+                        "error": str(exc),
+                        "terminal_recorded_at": result["timing"]["completed_at"],
+                    }
+                )
+                self._save_job(job)
+            controller.close()
+            try:
+                self._ack_terminal_job(job)
+            except RelayError as relay_exc:
+                LOG.warning("failed startup prerequisite recovery upload failed: %s", relay_exc)
+            return
         with self.navigation_lock:
             self.active_controller = controller
+            job["startup_context"] = startup_context
+            self._save_job(job)
         mission_id = job.get("mission_id")
         if not mission_id:
+            phase = str(job.get("phase", "received"))
+            if phase not in {"mission_submission", "mission"}:
+                with self.navigation_lock:
+                    job["phase"] = "recovery"
+                    job["phase_status"] = "recovering"
+                    job["updated_at"] = utc_now()
+                    self._save_job(job)
+                thread = threading.Thread(
+                    target=self._navigation_worker,
+                    args=(job, controller),
+                    name=f"navigation-recovery-{str(job['command_id'])[:8]}",
+                    daemon=True,
+                )
+                self.navigation_thread = thread
+                thread.start()
+                return
             cleanup = controller.cancel_active_operations(stop_navigation=True)
             result = self._terminal_result(job, {"ok": False, "robots": {}})
             result["status"] = "submission_unknown_after_restart"
@@ -1070,6 +1379,19 @@ class OrsusAgent:
             self.post_state(command_id, "FAILED", error="command payload must be an object")
             return
 
+        if command_type == "STARTUP":
+            try:
+                if payload:
+                    raise ConfigError("STARTUP payload must be an empty object")
+                self._begin_startup(command)
+            except (ConfigError, LocalApiError) as exc:
+                self.post_state(
+                    command_id,
+                    "FAILED",
+                    error=str(exc),
+                    device_recorded_at=utc_now(),
+                )
+            return
         if command_type == "NAVIGATE":
             try:
                 target = self._validated_target(payload)

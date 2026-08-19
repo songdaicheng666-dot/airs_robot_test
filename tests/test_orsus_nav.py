@@ -1,3 +1,5 @@
+import json
+import math
 import tempfile
 import unittest
 from pathlib import Path
@@ -63,6 +65,47 @@ class FakeSession:
 
     def close(self) -> None:
         return None
+
+
+class FakeWebSocket:
+    def __init__(self, messages: list[Any]):
+        self.messages = list(messages)
+        self.sent: list[str] = []
+        self.closed = False
+
+    def send(self, message: str) -> None:
+        self.sent.append(message)
+
+    def recv(self) -> Any:
+        result = self.messages.pop(0)
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def pose_message(*, frame_id: str = "SN-go2/map", x: float = 0.994, y: float = -0.344) -> str:
+    return json.dumps(
+        {
+            "op": "publish",
+            "topic": "/map_pose_odometry",
+            "msg": {
+                "header": {
+                    "frame_id": frame_id,
+                    "stamp": {"sec": 1787025387, "nanosec": 322111175},
+                },
+                "child_frame_id": "SN-go2/base_footprint",
+                "pose": {
+                    "pose": {
+                        "position": {"x": x, "y": y, "z": 0.0},
+                        "orientation": {"x": 0.0, "y": 0.0, "z": -0.5, "w": 0.5},
+                    }
+                },
+            },
+        }
+    )
 
 
 class MissionValidationTests(unittest.TestCase):
@@ -154,6 +197,72 @@ class HttpClientTests(unittest.TestCase):
 
         self.assertEqual(session.calls[0]["json"]["bringup_mode"], "navigation")
 
+    def test_current_map_pose_uses_fresh_websocket_publish(self) -> None:
+        websocket = FakeWebSocket(
+            [
+                json.dumps({"op": "status", "msg": "subscribed"}),
+                pose_message(),
+            ]
+        )
+        factory = MagicMock(return_value=websocket)
+        client = OrsusClient(
+            self.robot,
+            self.settings,
+            session=FakeSession([]),
+            websocket_factory=factory,
+        )
+
+        pose = client.current_map_pose()
+
+        factory.assert_called_once_with("ws://go2.example:7997", timeout=30.0)
+        self.assertEqual(
+            json.loads(websocket.sent[0]),
+            {"op": "subscribe", "topic": "/map_pose_odometry"},
+        )
+        self.assertAlmostEqual(pose["x"], 0.994)
+        self.assertAlmostEqual(pose["y"], -0.344)
+        self.assertAlmostEqual(pose["theta"], -math.pi / 2)
+        self.assertEqual(pose["frame_id"], "SN-go2/map")
+        self.assertIn("source_recorded_at", pose)
+        self.assertIn("pose_received_at", pose)
+        self.assertTrue(websocket.closed)
+
+    def test_current_map_pose_rejects_non_map_frame(self) -> None:
+        websocket = FakeWebSocket([pose_message(frame_id="SN-go2/odom")])
+        client = OrsusClient(
+            self.robot,
+            self.settings,
+            session=FakeSession([]),
+            websocket_factory=lambda *_args, **_kwargs: websocket,
+        )
+
+        with self.assertRaisesRegex(ApiError, "not a map frame"):
+            client.current_map_pose()
+
+    def test_current_map_pose_rejects_non_finite_position(self) -> None:
+        websocket = FakeWebSocket([pose_message(x=float("nan"))])
+        client = OrsusClient(
+            self.robot,
+            self.settings,
+            session=FakeSession([]),
+            websocket_factory=lambda *_args, **_kwargs: websocket,
+        )
+
+        with self.assertRaisesRegex(ApiError, "not finite"):
+            client.current_map_pose()
+
+    def test_current_map_pose_reports_websocket_timeout(self) -> None:
+        websocket = FakeWebSocket([TimeoutError("timed out")])
+        client = OrsusClient(
+            self.robot,
+            self.settings,
+            session=FakeSession([]),
+            websocket_factory=lambda *_args, **_kwargs: websocket,
+        )
+
+        with self.assertRaisesRegex(TransportError, "pose WebSocket failed"):
+            client.current_map_pose()
+
 
 class StubClient:
     def __init__(self, robot: RobotConfig):
@@ -165,13 +274,17 @@ class StubClient:
         self.cancelled_missions: list[str] = []
         self.mission_states = ["completed"]
         self.motion_states: list[dict[str, Any]] = []
+        self.navigation_states: list[dict[str, Any]] = []
         self.navigation_status_errors: list[Exception] = []
         self.navigation_status_calls = 0
+        self.enable_relocalization_count = 0
+        self.global_relocalization_count = 0
         self.interrupt_calls: list[str] = []
         self.stop_navigation_error: Exception | None = None
         self.cancel_error: Exception | None = None
         self.navigation_task_state = "running"
         self.stop_motion_count = 0
+        self.container_id = "container-1"
 
     def close(self) -> None:
         return None
@@ -213,15 +326,17 @@ class StubClient:
         }
 
     def nav_container_status(self) -> dict[str, Any]:
-        return {"running": True, "status": "running"}
+        return {"running": True, "status": "running", "container_id": self.container_id}
 
     def current_map(self) -> str:
         return self.robot.scene_name
 
     def enable_relocalization(self) -> None:
+        self.enable_relocalization_count += 1
         return None
 
     def global_relocalization(self) -> dict[str, Any]:
+        self.global_relocalization_count += 1
         if self.global_error:
             raise self.global_error
         return {"mode": "sequential", "accum_time_msec": 100}
@@ -230,7 +345,28 @@ class StubClient:
         self.navigation_status_calls += 1
         if self.navigation_status_errors:
             raise self.navigation_status_errors.pop(0)
-        return {"status": "idle", "relocalization": "active"}
+        if self.navigation_states:
+            return (
+                self.navigation_states.pop(0)
+                if len(self.navigation_states) > 1
+                else self.navigation_states[0]
+            )
+        return {
+            "status": "idle",
+            "relocalization": "successful",
+            "global_relocalization": "idle",
+        }
+
+    def current_map_pose(self) -> dict[str, Any]:
+        return {
+            "frame_id": f"{self.robot.expected_sn}/map",
+            "child_frame_id": f"{self.robot.expected_sn}/base_footprint",
+            "x": 1.0,
+            "y": 2.0,
+            "theta": 0.5,
+            "source_recorded_at": "2026-08-18T00:00:00+00:00",
+            "pose_received_at": "2026-08-18T00:00:00+00:00",
+        }
 
     def submit_mission(self, mission: dict[str, Any]) -> dict[str, Any]:
         self.submit_count += 1
@@ -316,6 +452,224 @@ class ControllerTests(unittest.TestCase):
 
         self.assertTrue(report["ok"])
         self.assertGreaterEqual(client.navigation_status_calls, 4)
+
+    def test_startup_always_relocalizes_and_returns_pose(self) -> None:
+        go2 = robot_config("go2")
+        client = StubClient(go2)
+        controller = DualRobotController(
+            self.app_config([go2]), [go2], clients={"go2": client}
+        )
+
+        report = controller.startup()
+
+        self.assertTrue(report["ok"])
+        self.assertEqual(client.enable_relocalization_count, 1)
+        self.assertEqual(client.global_relocalization_count, 1)
+        data = report["robots"]["go2"]["data"]
+        self.assertEqual(data["status"], "ready")
+        self.assertEqual(data["localization"]["status"], "successful")
+        self.assertEqual(data["localization"]["pose"]["theta"], 0.5)
+        self.assertEqual(client.submit_count, 0)
+
+    def test_navigate_relocalizes_before_submission_and_returns_pose(self) -> None:
+        mission = {"mode": "standard", "target": {"x": 1, "y": 2, "theta": 0.5}}
+        go2 = robot_config("go2", mission=mission)
+        client = StubClient(go2)
+        events: list[tuple[str, dict[str, Any]]] = []
+        controller = DualRobotController(
+            self.app_config([go2]),
+            [go2],
+            clients={"go2": client},
+            progress_callback=lambda name, event: events.append((name, event)),
+        )
+
+        report = controller.navigate()
+
+        self.assertTrue(report["ok"])
+        data = report["robots"]["go2"]["data"]
+        self.assertEqual(data["status"], "completed")
+        self.assertEqual(data["readiness"]["map"], go2.scene_name)
+        self.assertEqual(data["localization"]["pose"]["x"], 1.0)
+        self.assertEqual(client.submit_count, 1)
+        self.assertEqual(client.enable_relocalization_count, 1)
+        self.assertEqual(client.global_relocalization_count, 1)
+        phases = [event["phase"] for _name, event in events]
+        self.assertLess(phases.index("relocalization"), phases.index("mission_submission"))
+
+    def test_navigate_refreshes_failed_previous_localization(self) -> None:
+        mission = {"mode": "standard", "target": {"x": 1, "y": 2, "theta": 0.5}}
+        go2 = robot_config("go2", mission=mission)
+        client = StubClient(go2)
+        client.navigation_states = [
+            {
+                "status": "idle",
+                "relocalization": "failed",
+                "global_relocalization": "idle",
+            },
+            {
+                "status": "idle",
+                "relocalization": "failed",
+                "global_relocalization": "running",
+            },
+            {
+                "status": "idle",
+                "relocalization": "successful",
+                "global_relocalization": "successful",
+            },
+        ]
+        controller = DualRobotController(
+            self.app_config([go2]), [go2], clients={"go2": client}
+        )
+
+        report = controller.navigate()
+
+        self.assertTrue(report["ok"])
+        self.assertEqual(client.submit_count, 1)
+        self.assertEqual(client.global_relocalization_count, 1)
+
+    def test_navigate_relocalization_failure_prevents_submission(self) -> None:
+        mission = {"mode": "standard", "target": {"x": 1, "y": 2, "theta": 0.5}}
+        go2 = robot_config("go2", mission=mission)
+        client = StubClient(go2)
+        client.navigation_states = [
+            {
+                "status": "idle",
+                "relocalization": "successful",
+                "global_relocalization": "idle",
+            },
+            {
+                "status": "idle",
+                "relocalization": "failed",
+                "global_relocalization": "failed",
+            },
+        ]
+        controller = DualRobotController(
+            self.app_config([go2]), [go2], clients={"go2": client}
+        )
+
+        report = controller.navigate()
+
+        self.assertFalse(report["ok"])
+        self.assertIn("global relocalization failed", report["robots"]["go2"]["error"])
+        self.assertEqual(client.submit_count, 0)
+        self.assertEqual(client.global_relocalization_count, 1)
+
+    def test_navigate_rejects_replaced_navigation_container(self) -> None:
+        mission = {"mode": "standard", "target": {"x": 1, "y": 2, "theta": 0.5}}
+        go2 = robot_config("go2", mission=mission)
+        client = StubClient(go2)
+        controller = DualRobotController(
+            self.app_config([go2]), [go2], clients={"go2": client}
+        )
+
+        report = controller.navigate(expected_container_id="old-container")
+
+        self.assertFalse(report["ok"])
+        self.assertIn("navigation container changed", report["robots"]["go2"]["error"])
+        self.assertEqual(client.submit_count, 0)
+        self.assertEqual(client.global_relocalization_count, 0)
+
+    def test_relocalization_status_failure_fails_startup(self) -> None:
+        go2 = robot_config("go2")
+        client = StubClient(go2)
+        client.navigation_states = [
+            {"status": "idle", "relocalization": "successful"},
+            {
+                "status": "idle",
+                "relocalization": "failed",
+                "global_relocalization": "failed",
+            },
+        ]
+        controller = DualRobotController(
+            self.app_config([go2]), [go2], clients={"go2": client}
+        )
+
+        report = controller.startup()
+
+        self.assertFalse(report["ok"])
+        self.assertIn("global relocalization failed", report["robots"]["go2"]["error"])
+
+    def test_running_global_relocalization_ignores_stale_failure(self) -> None:
+        go2 = robot_config("go2")
+        client = StubClient(go2)
+        client.navigation_states = [
+            {
+                "status": "idle",
+                "relocalization": "failed",
+                "global_relocalization": "idle",
+            },
+            {
+                "status": "idle",
+                "relocalization": "failed",
+                "global_relocalization": "running",
+            },
+            {
+                "status": "idle",
+                "relocalization": "successful",
+                "global_relocalization": "idle",
+            },
+        ]
+        controller = DualRobotController(
+            self.app_config([go2]), [go2], clients={"go2": client}
+        )
+
+        report = controller.startup()
+
+        self.assertTrue(report["ok"])
+        self.assertEqual(client.navigation_status_calls, 3)
+
+    def test_global_failure_overrides_local_relocalization_success(self) -> None:
+        go2 = robot_config("go2")
+        client = StubClient(go2)
+        client.navigation_states = [
+            {
+                "status": "idle",
+                "relocalization": "successful",
+                "global_relocalization": "idle",
+            },
+            {
+                "status": "idle",
+                "relocalization": "successful",
+                "global_relocalization": "failed",
+            },
+        ]
+        controller = DualRobotController(
+            self.app_config([go2]), [go2], clients={"go2": client}
+        )
+
+        report = controller.startup()
+
+        self.assertFalse(report["ok"])
+        self.assertIn("global relocalization failed", report["robots"]["go2"]["error"])
+
+    def test_global_success_waits_for_local_relocalization_success(self) -> None:
+        go2 = robot_config("go2")
+        client = StubClient(go2)
+        client.navigation_states = [
+            {
+                "status": "idle",
+                "relocalization": "failed",
+                "global_relocalization": "idle",
+            },
+            {
+                "status": "idle",
+                "relocalization": "failed",
+                "global_relocalization": "successful",
+            },
+            {
+                "status": "idle",
+                "relocalization": "successful",
+                "global_relocalization": "successful",
+            },
+        ]
+        controller = DualRobotController(
+            self.app_config([go2]), [go2], clients={"go2": client}
+        )
+
+        report = controller.startup()
+
+        self.assertTrue(report["ok"])
+        self.assertEqual(client.navigation_status_calls, 3)
 
     def test_one_robot_failure_does_not_stop_the_other(self) -> None:
         mission = {"mode": "standard", "target": {"x": 1, "y": 2, "theta": 0}}

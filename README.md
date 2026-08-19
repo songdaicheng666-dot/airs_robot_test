@@ -1,8 +1,8 @@
 # Orsus 双机自动重定位导航控制器
 
-该工具通过 Orsus Edge Core 的 HTTP JSON API 控制两台机器人。网络层使用
-`requests.Session`，目标地址为 `http://<Orsus IP>:8898/v1/api`。程序不直接创建 TCP
-socket，也不使用 WebSocket 或 MQTT。
+该工具通过 Orsus Edge Core 的 HTTP JSON API 控制两台机器人。HTTP 接口使用
+`requests.Session`，目标地址为 `http://<Orsus IP>:8898/v1/api`；全局重定位成功后会连接
+导航容器在 `7997` 端口提供的 WebSocket，从 `/map_pose_odometry` 读取当前地图位姿。
 
 ## 安全边界
 
@@ -60,8 +60,8 @@ mission:
 - `complex`：复合任务，需要 `steps`，步骤类型支持 `navigate`、`fixed_point`、`rotate` 和
   `wait`。
 
-坐标单位为米，`theta` 单位为弧度。当前位置不需要写入配置：导航容器启动后，程序会调用
-`/nav/global_relocalization`，定位结果由导航栈内部持续维护。
+坐标单位为米，`theta` 单位为弧度。当前位置不需要写入配置：程序调用
+`/nav/global_relocalization`、验证重定位成功，然后从 `/map_pose_odometry` 返回 `x/y/theta`。
 
 ## 使用命令
 
@@ -70,6 +70,10 @@ mission:
 ```bash
 python3 -m pip install -r requirements.txt
 ```
+
+通过 ECS 和 5G 启动单台机器的 motion/scan/nav 连接并生成自检报告时，使用独立
+[`startup_test`](startup_test/README.md)；确认 `COMPLETED/ready` 后，再运行
+[`navigation_test`](navigation_test/README.md) 下发正式导航目标。
 
 查看两台设备、适配器、地图和命名点：
 
@@ -128,7 +132,8 @@ adapter、scan 和导航容器保持运行，因此后续可以直接重新执�
    再等待容器内导航 API 能成功返回状态。
 5. 开启 `/nav/relocalization_toggle`。
 6. 调用 `/nav/global_relocalization`；默认模式是 `sequential`。
-7. 向 `/nav/missions` 提交任务，并轮询 `/nav/missions/{mission_id}`。
+7. 验证 `/nav/navigation_status` 的重定位结果，再从 `7997` WebSocket 读取新鲜地图位姿。
+8. 向 `/nav/missions` 提交任务，并轮询 `/nav/missions/{mission_id}`。
 
 提交任务前及任务运行期间，控制器会持续验证运动适配器处于 `CONNECTED`，并检查适配器的
 `available` 和 `transport_ready`。运动链路掉线时，该机器的 mission 会被立即取消，另一台机器

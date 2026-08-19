@@ -1,6 +1,7 @@
 # Matrice 4T 与 Go2 Orsus 5G 通信测试
 
-通过 ECS 下发 Go2/Scout 导航目标、远程取消并生成通信指标报告的新增流程见
+通过 ECS 启动机器人连接并自检的独立 demo 见 [`startup_test/README.md`](../startup_test/README.md)；
+后续下发 Go2/Scout 导航目标、远程取消并生成通信指标报告的流程见
 [`navigation_test/README.md`](../navigation_test/README.md)。原有 PING/STATUS_QUERY 联通测试仍可独立使用。
 
 这套程序用于验证以下链路：
@@ -9,8 +10,9 @@
 电脑结构化 JSON -> 阿里云 -> M4T/Orsus 长轮询 -> 设备遥测 -> 阿里云 -> 电脑
 ```
 
-`PING` 和 `STATUS_QUERY` 仍用于无运动联通测试。Go2/Scout 导航只通过独立的
-`navigation_test` 客户端开放，并受设备类型、固定地图、单活动任务、5G 路由和传输安全门禁保护。
+`PING` 和 `STATUS_QUERY` 仍用于无运动联通测试。Go2/Scout 的 `STARTUP` 只通过独立的
+`startup_test` 客户端开放，`NAVIGATE`/`CANCEL_NAVIGATION` 只通过 `navigation_test` 开放；
+这些写操作均受设备类型、固定地图、单活动任务、5G 路由和传输安全门禁保护。
 M4T 没有新增 FlyTo、起飞或电机启动权限，联调时仍应保持落地且电机关闭。
 
 ## 目录
@@ -323,7 +325,7 @@ communication_test/deploy/orsus/build_vendor_archive.sh \
   /tmp/orsus-python-vendor.tar.gz
 ```
 
-Agent 会优先从 `/opt/orsus-ecs-agent/vendor` 加载 `requests` 和 `PyYAML`，不会修改系统 Python 包。安装脚本在
+Agent 会优先从 `/opt/orsus-ecs-agent/vendor` 加载 `requests`、`PyYAML` 和 `websocket-client`，不会修改系统 Python 包。安装脚本在
 没有传入隔离依赖包且系统无法导入这些包时，才会尝试使用 APT。先根据示例创建私密配置，
 填入 ECS 注册表中同一枚 Orsus Token：
 
@@ -333,23 +335,23 @@ cp communication_test/deploy/orsus/orsus-ecs-agent.env.example \
 chmod 600 communication_test/.private/orsus-ecs-agent.env
 ```
 
-通过有线管理口上传 Agent、导航控制器和部署资源。Go2 和 Scout 的有线地址都可能是 `192.168.123.100`，因此使用
-独立 `HostKeyAlias`：
+当电脑与 Go2 Orsus 处于同一随身 WiFi 时，可通过热点管理地址上传 Agent、导航控制器和
+部署资源，不强制使用网线：
 
 ```bash
-scp -o HostKeyAlias=orsus-go2-wired \
+scp -o HostKeyAlias=orsus-go2-5g \
   communication_test/orsus/agent.py \
   orsus_nav.py \
   communication_test/deploy/orsus/orsus-ecs-agent.service \
   communication_test/.private/orsus-ecs-agent.env \
   /tmp/orsus-python-vendor.tar.gz \
-  gs@192.168.123.100:/tmp/
+  gs@192.168.0.69:/tmp/
 
-scp -o HostKeyAlias=orsus-go2-wired \
+scp -o HostKeyAlias=orsus-go2-5g \
   communication_test/deploy/orsus/install.sh \
-  gs@192.168.123.100:/tmp/install-orsus-ecs-agent.sh
+  gs@192.168.0.69:/tmp/install-orsus-ecs-agent.sh
 
-ssh -t -o HostKeyAlias=orsus-go2-wired gs@192.168.123.100 \
+ssh -t -o HostKeyAlias=orsus-go2-5g gs@192.168.0.69 \
   'sudo bash /tmp/install-orsus-ecs-agent.sh \
     /tmp/agent.py \
     /tmp/orsus-ecs-agent.env \
@@ -358,11 +360,11 @@ ssh -t -o HostKeyAlias=orsus-go2-wired gs@192.168.123.100 \
     /tmp/orsus_nav.py'
 ```
 
-服务以 `gs` 用户运行；状态查询保持只读，只有通过导航安全门禁的 `NAVIGATE`/`CANCEL_NAVIGATION`
-才会调用 Edge Core 写接口。检查服务和日志：
+服务以 `gs` 用户运行；状态查询保持只读，只有通过安全门禁的 `STARTUP`、`NAVIGATE` 和
+`CANCEL_NAVIGATION` 才会调用 Edge Core 写接口。检查服务和日志：
 
 ```bash
-ssh -o HostKeyAlias=orsus-go2-wired gs@192.168.123.100 \
+ssh -o HostKeyAlias=orsus-go2-5g gs@192.168.0.69 \
   'systemctl status orsus-ecs-agent --no-pager; \
    journalctl -u orsus-ecs-agent -n 100 --no-pager'
 ```
@@ -387,7 +389,9 @@ python3 -m communication_test.pc.client status
 
 ### 10.4 安全边界
 
-- M4T 仍只接受 `PING` 和 `STATUS_QUERY`；Orsus 额外接受严格校验的 `NAVIGATE` 和 `CANCEL_NAVIGATION`。
+- M4T 仍只接受 `PING` 和 `STATUS_QUERY`；Orsus 额外接受严格校验的 `STARTUP`、`NAVIGATE` 和 `CANCEL_NAVIGATION`。
+- Orsus 必须先完成 `STARTUP/ready` 才能接受 `NAVIGATE`；Agent 会同时校验当前开机周期的启动凭据和实时服务状态。
+- 每条 `NAVIGATE` 都会在提交 mission 前重新执行全局重定位并获取新鲜位姿；失败或缺少位姿时不提交 mission。
 - 公网 HTTP 会明文传输 Bearer Token 和导航目标。只有 ECS、Agent 和本机三端同时显式启用不安全开关时才允许测试，结束后必须轮换 Token。
 - Agent 日志不得出现 Token；Uvicorn `8000` 继续只监听 ECS 本机，公网仅访问 Nginx `80`。
-- 正式使用必须部署 HTTPS；完整导航部署、取消、指标和实机验收步骤见 `navigation_test/README.md`。
+- 正式使用必须部署 HTTPS；启动自检见 `startup_test/README.md`，完整导航部署、取消、指标和实机验收见 `navigation_test/README.md`。

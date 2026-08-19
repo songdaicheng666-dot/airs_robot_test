@@ -28,10 +28,18 @@ class ApiError(RuntimeError):
 
 
 class RelayClient:
-    def __init__(self, base_url: str, token: str, *, timeout: float = 35.0):
+    def __init__(
+        self,
+        base_url: str,
+        token: str,
+        *,
+        timeout: float = 35.0,
+        user_agent: str = "navigation-test-client/1.0",
+    ):
         self.base_url = base_url.rstrip("/")
         self.token = token
         self.timeout = timeout
+        self.user_agent = user_agent
         self.samples: list[dict[str, Any]] = []
 
     def request_json(
@@ -49,7 +57,7 @@ class RelayClient:
                 "Authorization": f"Bearer {self.token}",
                 "Content-Type": "application/json",
                 "Accept": "application/json",
-                "User-Agent": "navigation-test-client/1.0",
+                "User-Agent": self.user_agent,
             },
         )
         recorded_at = utc_now()
@@ -204,6 +212,24 @@ def require_safe_transport(base_url: str, allow_insecure: bool) -> bool:
     raise ApiError("public navigation over HTTP requires --allow-insecure-http")
 
 
+def localization_pose(result: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    localization = result.get("localization")
+    pose = localization.get("pose") if isinstance(localization, dict) else None
+    if not isinstance(localization, dict) or localization.get("status") != "successful":
+        return None
+    if not isinstance(pose, dict):
+        return None
+    for name in ("x", "y", "theta"):
+        value = pose.get(name)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+        ):
+            return None
+    return localization, pose
+
+
 def build_metrics(
     client: RelayClient,
     command: dict[str, Any],
@@ -264,7 +290,8 @@ def write_report(
         "device_id": device_id,
         "passed": command.get("state") == "COMPLETED"
         and isinstance(command.get("result"), dict)
-        and command["result"].get("status") == "completed",
+        and command["result"].get("status") == "completed"
+        and localization_pose(command["result"]) is not None,
         "security": {"insecure_http": insecure_http},
         "command": command,
         "metrics": build_metrics(client, command, observed_at, pc_clock),
@@ -400,7 +427,44 @@ def main(argv: list[str] | None = None) -> int:
         if interrupted:
             return 130
         result = terminal.get("result")
-        return 0 if terminal["state"] == "COMPLETED" and isinstance(result, dict) and result.get("status") == "completed" else 1
+        if terminal.get("state") == "COMPLETED" and isinstance(result, dict) and result.get(
+            "status"
+        ) == "completed":
+            localized = localization_pose(result)
+            if localized is None:
+                print(
+                    "navigation failed at relocalization: "
+                    "completed result has no fresh successful localization pose",
+                    file=sys.stderr,
+                )
+                return 1
+            localization, pose = localized
+            theta = float(pose["theta"])
+            print(
+                "localized before navigation: "
+                f"map={localization.get('map', 'unknown')} "
+                f"x={float(pose['x']):.3f} y={float(pose['y']):.3f} "
+                f"theta={theta:.6f} rad ({math.degrees(theta):.2f} deg)"
+            )
+            target = result.get("target") if isinstance(result.get("target"), dict) else {}
+            print(
+                "navigation completed: "
+                f"mission={result.get('mission_id', 'unknown')} "
+                f"target=({target.get('x', 'unknown')}, {target.get('y', 'unknown')}, "
+                f"{target.get('theta', 'unknown')})"
+            )
+            return 0
+        progress = terminal.get("progress") if isinstance(terminal.get("progress"), dict) else {}
+        phase = (
+            result.get("failed_phase")
+            if isinstance(result, dict) and result.get("failed_phase")
+            else progress.get("phase", "unknown")
+        )
+        detail = terminal.get("error")
+        if not detail and isinstance(result, dict):
+            detail = result.get("status")
+        print(f"navigation failed at {phase}: {detail or 'unknown error'}", file=sys.stderr)
+        return 1
     except ApiError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

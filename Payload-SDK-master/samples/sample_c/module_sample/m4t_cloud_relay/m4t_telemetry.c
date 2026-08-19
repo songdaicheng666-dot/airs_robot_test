@@ -187,17 +187,17 @@ static void M4tTelemetry_Sample(const T_M4tSubscriptions *subscriptions, uint64_
     }
 
     if (subscriptions->battery) {
-        T_DjiFcSubscriptionWholeBatteryInfo battery = {0};
+        T_DjiFcSubscriptionSingleBatteryInfo battery = {0};
         result = DjiFcSubscription_GetLatestValueOfTopic(
-            DJI_FC_SUBSCRIPTION_TOPIC_BATTERY_INFO,
+            DJI_FC_SUBSCRIPTION_TOPIC_BATTERY_SINGLE_INFO_INDEX1,
             (uint8_t *) &battery,
             sizeof(battery),
             &timestamp);
         if (result == DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
             next.batteryValid = true;
-            next.batteryPercentage = battery.percentage;
-            next.batteryVoltageV = battery.voltage / 1000.0f;
-            next.batteryCurrentA = battery.current / 1000.0f;
+            next.batteryPercentage = battery.batteryCapacityPercent;
+            next.batteryVoltageV = battery.currentVoltage / 1000.0f;
+            next.batteryCurrentA = battery.currentElectric / 1000.0f;
             anyTopicValid = true;
         }
     }
@@ -231,7 +231,7 @@ static void *M4tTelemetry_Task(void *argument)
     subscriptions.gps = M4tTelemetry_Subscribe(DJI_FC_SUBSCRIPTION_TOPIC_GPS_DETAILS, "GPS details");
     subscriptions.rtkConnection = M4tTelemetry_Subscribe(DJI_FC_SUBSCRIPTION_TOPIC_RTK_CONNECT_STATUS, "RTK connection");
     subscriptions.rtkPosition = M4tTelemetry_Subscribe(DJI_FC_SUBSCRIPTION_TOPIC_RTK_POSITION_INFO, "RTK position info");
-    subscriptions.battery = M4tTelemetry_Subscribe(DJI_FC_SUBSCRIPTION_TOPIC_BATTERY_INFO, "battery info");
+    subscriptions.battery = M4tTelemetry_Subscribe(DJI_FC_SUBSCRIPTION_TOPIC_BATTERY_SINGLE_INFO_INDEX1, "battery index 1");
 
     while (true) {
         M4tTelemetry_Sample(&subscriptions, ++sequence);

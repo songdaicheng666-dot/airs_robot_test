@@ -165,13 +165,13 @@ class RelayStore:
                     connection.rollback()
                     raise InvalidStateTransition("cancel target is not a navigation command")
 
-            if command_type == "NAVIGATE":
+            if command_type in {"STARTUP", "NAVIGATE"}:
                 connection.execute(
                     """
                     UPDATE commands
                     SET state = 'FAILED', updated_at = ?, terminal_at = COALESCE(terminal_at, ?),
                         error_message = 'command expired before receipt', lease_until = NULL
-                    WHERE device_id = ? AND command_type = 'NAVIGATE'
+                    WHERE device_id = ? AND command_type IN ('STARTUP', 'NAVIGATE')
                       AND state IN ('QUEUED', 'DELIVERED', 'RECEIVED', 'RUNNING')
                       AND expires_at <= ?
                     """,
@@ -180,7 +180,7 @@ class RelayStore:
                 active = connection.execute(
                     """
                     SELECT command_id FROM commands
-                    WHERE device_id = ? AND command_type = 'NAVIGATE'
+                    WHERE device_id = ? AND command_type IN ('STARTUP', 'NAVIGATE')
                       AND state IN ('QUEUED', 'DELIVERED', 'RECEIVED', 'RUNNING')
                     ORDER BY created_at ASC LIMIT 1
                     """,
@@ -189,8 +189,39 @@ class RelayStore:
                 if active is not None:
                     connection.rollback()
                     raise ActiveNavigationConflict(
-                        f"device already has active navigation command {active['command_id']}"
+                        f"device already has active startup or navigation command {active['command_id']}"
                     )
+
+                if command_type == "NAVIGATE":
+                    latest_startup = connection.execute(
+                        """
+                        SELECT command_id, state, result_json FROM commands
+                        WHERE device_id = ? AND command_type = 'STARTUP'
+                        ORDER BY created_at DESC LIMIT 1
+                        """,
+                        (device_id,),
+                    ).fetchone()
+                    startup_ready = False
+                    if latest_startup is not None and latest_startup["state"] == "COMPLETED":
+                        try:
+                            startup_result = json.loads(latest_startup["result_json"] or "null")
+                        except json.JSONDecodeError:
+                            startup_result = None
+                        startup_ready = (
+                            isinstance(startup_result, dict)
+                            and startup_result.get("status") == "ready"
+                        )
+                    if not startup_ready:
+                        connection.rollback()
+                        latest_id = (
+                            latest_startup["command_id"]
+                            if latest_startup is not None
+                            else "none"
+                        )
+                        raise InvalidStateTransition(
+                            "successful STARTUP is required before NAVIGATE; "
+                            f"latest_startup={latest_id}"
+                        )
 
             connection.execute(
                 """

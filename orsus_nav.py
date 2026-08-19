@@ -7,6 +7,7 @@ import argparse
 import copy
 import json
 import logging
+import math
 import os
 import sys
 import threading
@@ -36,6 +37,9 @@ INACTIVE_NAVIGATION_STATES = TERMINAL_MISSION_STATES | {
     "not_running",
     "stopped",
 }
+RELOCALIZATION_SUCCESS_STATES = {"success", "successful", "succeeded", "completed"}
+RELOCALIZATION_FAILURE_STATES = {"failed", "failure", "error", "cancelled", "canceled"}
+RELOCALIZATION_ACTIVE_STATES = {"pending", "starting", "running", "in_progress"}
 
 
 class OrsusError(RuntimeError):
@@ -345,16 +349,20 @@ class StateStore:
 
 class OrsusClient:
     API_PREFIX = "/v1/api"
+    POSE_WEBSOCKET_PORT = 7997
+    POSE_TOPIC = "/map_pose_odometry"
 
     def __init__(
         self,
         config: RobotConfig,
         settings: HttpSettings,
         session: Optional[requests.Session] = None,
+        websocket_factory: Optional[Callable[..., Any]] = None,
     ):
         self.config = config
         self.settings = settings
         self.session = session or requests.Session()
+        self.websocket_factory = websocket_factory
         self.session.headers.update({"Accept": "application/json"})
 
     def close(self) -> None:
@@ -550,6 +558,157 @@ class OrsusClient:
 
     def navigation_status(self) -> dict[str, Any]:
         return self._request_json("POST", "/nav/navigation_status", retry_read=True)
+
+    def _pose_websocket_url(self) -> str:
+        parsed = urlparse(self.config.base_url)
+        if not parsed.hostname:
+            raise ConfigError(f"{self.config.name}: Orsus base URL has no hostname")
+        host = f"[{parsed.hostname}]" if ":" in parsed.hostname else parsed.hostname
+        scheme = "wss" if parsed.scheme == "https" else "ws"
+        return f"{scheme}://{host}:{self.POSE_WEBSOCKET_PORT}"
+
+    def _open_pose_websocket(self) -> Any:
+        factory = self.websocket_factory
+        if factory is None:
+            try:
+                from websocket import create_connection
+            except ImportError as exc:
+                raise ConfigError(
+                    "websocket-client is required to read the relocalized robot pose"
+                ) from exc
+            factory = create_connection
+        return factory(
+            self._pose_websocket_url(),
+            timeout=self.settings.read_timeout_seconds,
+        )
+
+    @staticmethod
+    def _pose_from_message(message: Any) -> dict[str, Any] | None:
+        if isinstance(message, bytes):
+            try:
+                message = message.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise ApiError("pose WebSocket returned non-UTF-8 data") from exc
+        if not isinstance(message, str):
+            raise ApiError("pose WebSocket returned a non-text message")
+        try:
+            payload = json.loads(message)
+        except json.JSONDecodeError as exc:
+            raise ApiError("pose WebSocket returned invalid JSON") from exc
+        if not isinstance(payload, dict):
+            raise ApiError("pose WebSocket returned a non-object message")
+        if payload.get("op") != "publish" or payload.get("topic") != OrsusClient.POSE_TOPIC:
+            return None
+
+        odometry = payload.get("msg")
+        if not isinstance(odometry, dict):
+            raise ApiError("pose publish message has no odometry object")
+        header = odometry.get("header")
+        pose_wrapper = odometry.get("pose")
+        pose = pose_wrapper.get("pose") if isinstance(pose_wrapper, dict) else None
+        position = pose.get("position") if isinstance(pose, dict) else None
+        orientation = pose.get("orientation") if isinstance(pose, dict) else None
+        if not all(isinstance(value, dict) for value in (header, position, orientation)):
+            raise ApiError("pose publish message has an invalid odometry structure")
+
+        frame_id = header.get("frame_id")
+        if not isinstance(frame_id, str) or not (
+            frame_id == "map" or frame_id.endswith("/map")
+        ):
+            raise ApiError(f"pose frame is not a map frame: {frame_id!r}")
+        child_frame_id = odometry.get("child_frame_id")
+        if not isinstance(child_frame_id, str) or not child_frame_id:
+            raise ApiError("pose publish message has no child_frame_id")
+
+        stamp = header.get("stamp")
+        if not isinstance(stamp, dict):
+            raise ApiError("pose publish message has no ROS timestamp")
+        seconds = stamp.get("sec")
+        nanoseconds = stamp.get("nanosec")
+        if (
+            isinstance(seconds, bool)
+            or not isinstance(seconds, int)
+            or seconds < 0
+            or isinstance(nanoseconds, bool)
+            or not isinstance(nanoseconds, int)
+            or not 0 <= nanoseconds < 1_000_000_000
+        ):
+            raise ApiError("pose publish message has an invalid ROS timestamp")
+        try:
+            source_recorded_at = datetime.fromtimestamp(
+                seconds + nanoseconds / 1_000_000_000,
+                tz=timezone.utc,
+            ).isoformat()
+        except (OverflowError, OSError, ValueError) as exc:
+            raise ApiError("pose publish message has an out-of-range ROS timestamp") from exc
+
+        values: dict[str, float] = {}
+        for name, source in (
+            ("x", position.get("x")),
+            ("y", position.get("y")),
+            ("qx", orientation.get("x")),
+            ("qy", orientation.get("y")),
+            ("qz", orientation.get("z")),
+            ("qw", orientation.get("w")),
+        ):
+            if isinstance(source, bool) or not isinstance(source, (int, float)):
+                raise ApiError(f"pose field {name} is not numeric")
+            value = float(source)
+            if not math.isfinite(value):
+                raise ApiError(f"pose field {name} is not finite")
+            values[name] = value
+
+        quaternion_norm = math.sqrt(
+            values["qx"] ** 2
+            + values["qy"] ** 2
+            + values["qz"] ** 2
+            + values["qw"] ** 2
+        )
+        if quaternion_norm <= 1e-12:
+            raise ApiError("pose orientation quaternion has zero length")
+        qx = values["qx"] / quaternion_norm
+        qy = values["qy"] / quaternion_norm
+        qz = values["qz"] / quaternion_norm
+        qw = values["qw"] / quaternion_norm
+        theta = math.atan2(
+            2 * (qw * qz + qx * qy),
+            1 - 2 * (qy * qy + qz * qz),
+        )
+        return {
+            "frame_id": frame_id,
+            "child_frame_id": child_frame_id,
+            "x": values["x"],
+            "y": values["y"],
+            "theta": theta,
+            "source_recorded_at": source_recorded_at,
+            "pose_received_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    def current_map_pose(self) -> dict[str, Any]:
+        websocket: Any = None
+        try:
+            websocket = self._open_pose_websocket()
+            websocket.send(json.dumps({"op": "subscribe", "topic": self.POSE_TOPIC}))
+            deadline = time.monotonic() + self.settings.read_timeout_seconds
+            while time.monotonic() < deadline:
+                pose = self._pose_from_message(websocket.recv())
+                if pose is not None:
+                    return pose
+            raise ApiError(
+                f"{self.config.name}: timed out waiting for a pose publish on {self.POSE_TOPIC}"
+            )
+        except OrsusError:
+            raise
+        except Exception as exc:
+            raise TransportError(
+                f"{self.config.name}: pose WebSocket failed: {exc}"
+            ) from exc
+        finally:
+            if websocket is not None:
+                try:
+                    websocket.close()
+                except Exception:
+                    pass
 
     def navigation_task_status(self) -> dict[str, Any]:
         return self._request_json("POST", "/nav/navigation_task_status", retry_read=True)
@@ -909,7 +1068,114 @@ class DualRobotController:
             f"{robot.name}: timeout waiting for navigation API readiness; last_error={last_error}"
         )
 
-    def _startup_one(self, robot: RobotConfig, client: OrsusClient) -> dict[str, Any]:
+    def _wait_for_relocalization_result(
+        self,
+        robot: RobotConfig,
+        client: OrsusClient,
+    ) -> dict[str, Any]:
+        deadline = time.monotonic() + self.config.http.service_start_timeout_seconds
+        last_status: dict[str, Any] | None = None
+        while time.monotonic() < deadline:
+            if self.stop_event.is_set():
+                raise InterruptedError(
+                    f"{robot.name}: interrupted while waiting for global relocalization"
+                )
+            status = client.navigation_status()
+            if not isinstance(status, dict):
+                raise ApiError(
+                    f"{robot.name}: navigation status is not an object after relocalization"
+                )
+            last_status = status
+            relocalization = str(status.get("relocalization", "")).strip().lower()
+            global_relocalization = str(
+                status.get("global_relocalization", "")
+            ).strip().lower()
+            if global_relocalization in RELOCALIZATION_ACTIVE_STATES:
+                time.sleep(self.config.http.poll_interval_seconds)
+                continue
+            if global_relocalization in RELOCALIZATION_FAILURE_STATES:
+                raise ApiError(
+                    f"{robot.name}: global relocalization failed; status={status}"
+                )
+            if relocalization in RELOCALIZATION_SUCCESS_STATES:
+                return status
+            if global_relocalization in RELOCALIZATION_SUCCESS_STATES:
+                time.sleep(self.config.http.poll_interval_seconds)
+                continue
+            if relocalization in RELOCALIZATION_FAILURE_STATES:
+                raise ApiError(
+                    f"{robot.name}: global relocalization failed; status={status}"
+                )
+            time.sleep(self.config.http.poll_interval_seconds)
+        raise ApiError(
+            f"{robot.name}: timeout waiting for successful global relocalization; "
+            f"last={last_status}"
+        )
+
+    def _relocalize_and_get_pose(
+        self,
+        robot: RobotConfig,
+        client: OrsusClient,
+    ) -> dict[str, Any]:
+        LOG.info("%s: running %s global relocalization", robot.name, robot.relocalization_mode)
+        self._emit_progress(
+            robot.name,
+            "relocalization",
+            "started",
+            mode=robot.relocalization_mode,
+        )
+        with self._active_lock:
+            self._active_relocalizations.add(robot.name)
+        relocalization_response_unknown = False
+        try:
+            client.enable_relocalization()
+            try:
+                relocalization_response = client.global_relocalization()
+            except TransportError:
+                relocalization_response = None
+                relocalization_response_unknown = True
+            navigation = self._wait_for_relocalization_result(robot, client)
+        finally:
+            with self._active_lock:
+                self._active_relocalizations.discard(robot.name)
+        if self.stop_event.is_set():
+            raise InterruptedError(f"{robot.name}: interrupted after global relocalization")
+        pose = client.current_map_pose()
+        localization = {
+            "status": "successful",
+            "map": robot.scene_name,
+            "mode": robot.relocalization_mode,
+            "pose": pose,
+            "response": relocalization_response,
+            "response_unknown": relocalization_response_unknown,
+            "navigation_status": navigation,
+        }
+        self._emit_progress(
+            robot.name,
+            "relocalization",
+            "completed",
+            localization=localization,
+        )
+        motion_after_relocalization = client.motion_status()
+        motion_ready, motion_reason = _motion_ready(
+            motion_after_relocalization, robot.adapter_type
+        )
+        if not motion_ready:
+            raise ApiError(
+                f"{robot.name}: motion adapter became unhealthy before mission submission: "
+                f"{motion_reason}"
+            )
+        return {
+            "localization": localization,
+            "navigation_status": navigation,
+            "motion_after_relocalization": motion_after_relocalization,
+        }
+
+    def _startup_one(
+        self,
+        robot: RobotConfig,
+        client: OrsusClient,
+    ) -> dict[str, Any]:
         self._emit_progress(robot.name, "preflight", "started")
         preflight = self._preflight_one(robot, client, require_mission=False)
         self._emit_progress(robot.name, "preflight", "completed")
@@ -925,49 +1191,15 @@ class DualRobotController:
         self._emit_progress(robot.name, "navigation_container", "started")
         nav_container = self._ensure_nav_container(robot, client)
         self._emit_progress(robot.name, "navigation_container", "completed")
-        client.enable_relocalization()
-        LOG.info("%s: running %s global relocalization", robot.name, robot.relocalization_mode)
-        self._emit_progress(
-            robot.name,
-            "relocalization",
-            "started",
-            mode=robot.relocalization_mode,
-        )
-        with self._active_lock:
-            self._active_relocalizations.add(robot.name)
-        try:
-            try:
-                relocalization = client.global_relocalization()
-            except TransportError as exc:
-                status = client.navigation_status()
-                raise TransportError(
-                    f"{robot.name}: global relocalization response is unknown; status={status}; {exc}"
-                ) from exc
-        finally:
-            with self._active_lock:
-                self._active_relocalizations.discard(robot.name)
-        if self.stop_event.is_set():
-            raise InterruptedError(f"{robot.name}: interrupted after global relocalization")
-        self._emit_progress(robot.name, "relocalization", "completed")
-        navigation = client.navigation_status()
-        motion_after_relocalization = client.motion_status()
-        motion_ready, motion_reason = _motion_ready(
-            motion_after_relocalization, robot.adapter_type
-        )
-        if not motion_ready:
-            raise ApiError(
-                f"{robot.name}: motion adapter became unhealthy before mission submission: "
-                f"{motion_reason}"
-            )
+        relocalization = self._relocalize_and_get_pose(robot, client)
         return {
             "success": True,
+            "status": "ready",
             "preflight": preflight,
             "motion": motion,
             "scan": scan,
             "nav_container": nav_container,
-            "relocalization": relocalization,
-            "navigation_status": navigation,
-            "motion_after_relocalization": motion_after_relocalization,
+            **relocalization,
         }
 
     def startup(self) -> dict[str, Any]:
@@ -1033,9 +1265,79 @@ class DualRobotController:
                 raise ApiError(f"{robot.name}: timeout waiting for mission {mission_id}; status={status}")
             time.sleep(self.config.http.poll_interval_seconds)
 
-    def _run_one(self, robot: RobotConfig, client: OrsusClient) -> dict[str, Any]:
-        validate_robot_for_preflight(robot, require_mission=True)
-        startup = self._startup_one(robot, client)
+    def _navigation_readiness_one(
+        self,
+        robot: RobotConfig,
+        client: OrsusClient,
+        expected_container_id: str | None = None,
+    ) -> dict[str, Any]:
+        self._emit_progress(robot.name, "readiness", "started")
+        preflight = self._preflight_one(robot, client, require_mission=True)
+
+        motion = client.motion_status()
+        motion_ready, motion_reason = _motion_ready(motion, robot.adapter_type)
+        if not motion_ready:
+            raise ApiError(
+                f"{robot.name}: STARTUP is required before navigation; {motion_reason}"
+            )
+
+        scan = client.scan_status()
+        if not _scan_ready(scan):
+            raise ApiError(
+                f"{robot.name}: STARTUP is required before navigation; scan services are not ready"
+            )
+
+        nav_container = client.nav_container_status()
+        if not _nav_running(nav_container):
+            raise ApiError(
+                f"{robot.name}: STARTUP is required before navigation; "
+                "navigation container is not running"
+            )
+        actual_container_id = nav_container.get("container_id")
+        if expected_container_id and actual_container_id != expected_container_id:
+            raise ApiError(
+                f"{robot.name}: STARTUP is required before navigation; navigation container "
+                f"changed from {expected_container_id!r} to {actual_container_id!r}"
+            )
+
+        navigation = client.navigation_status()
+        if not isinstance(navigation, dict):
+            raise ApiError(
+                f"{robot.name}: STARTUP is required before navigation; "
+                "navigation status is not an object"
+            )
+        current_map = client.current_map()
+        if current_map != robot.scene_name:
+            raise ApiError(
+                f"{robot.name}: STARTUP is required before navigation; "
+                f"active map is {current_map!r}, expected {robot.scene_name!r}"
+            )
+
+        global_relocalization = str(
+            navigation.get("global_relocalization", "")
+        ).strip().lower()
+        if global_relocalization in RELOCALIZATION_ACTIVE_STATES:
+            raise ApiError(
+                f"{robot.name}: another global relocalization is already active: {navigation}"
+            )
+
+        readiness = {
+            "success": True,
+            "preflight": preflight,
+            "motion": motion,
+            "scan": scan,
+            "nav_container": nav_container,
+            "navigation_status": navigation,
+            "map": current_map,
+        }
+        self._emit_progress(robot.name, "readiness", "completed")
+        return readiness
+
+    def _submit_and_track_mission(
+        self,
+        robot: RobotConfig,
+        client: OrsusClient,
+    ) -> dict[str, Any]:
         if self.stop_event.is_set():
             raise InterruptedError(f"{robot.name}: interrupted before mission submission")
         mission = normalize_mission(robot.mission, f"robots.{robot.name}.mission")
@@ -1071,12 +1373,44 @@ class DualRobotController:
             "completed",
             mission_id=mission_id,
         )
-        result = self._track_mission(robot, client, mission_id)
+        return self._track_mission(robot, client, mission_id)
+
+    def _run_one(self, robot: RobotConfig, client: OrsusClient) -> dict[str, Any]:
+        validate_robot_for_preflight(robot, require_mission=True)
+        startup = self._startup_one(robot, client)
+        result = self._submit_and_track_mission(robot, client)
         result["startup"] = startup
         return result
 
     def run(self) -> dict[str, Any]:
         return self._parallel(self._run_one)
+
+    def _navigate_one(
+        self,
+        robot: RobotConfig,
+        client: OrsusClient,
+        expected_container_id: str | None,
+    ) -> dict[str, Any]:
+        readiness = self._navigation_readiness_one(
+            robot,
+            client,
+            expected_container_id,
+        )
+        relocalization = self._relocalize_and_get_pose(robot, client)
+        result = self._submit_and_track_mission(robot, client)
+        result["readiness"] = readiness
+        result.update(relocalization)
+        return result
+
+    def navigate(self, *, expected_container_id: str | None = None) -> dict[str, Any]:
+        """Relocalize, then submit a mission using services prepared by STARTUP."""
+        return self._parallel(
+            lambda robot, client: self._navigate_one(
+                robot,
+                client,
+                expected_container_id,
+            )
+        )
 
     def resume_mission(self, mission_id: str) -> dict[str, Any]:
         if len(self.robots) != 1:

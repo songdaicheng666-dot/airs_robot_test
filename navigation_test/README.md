@@ -9,7 +9,11 @@
 
 第一阶段支持 Go2 和 Scout 的单点 `standard` 导航，每次只选择一台设备。地图及适配器固定在
 设备 Agent 配置中，本机只发送 `x/y/theta`。Go2 当前配置为
-`airs1f_3/localization/go2`；Scout 为 `airs_inter/navigation/scout`。
+`airs1f_3/navigation/go2`；Scout 为 `airs_inter/navigation/scout`。Go2 当前的
+`nav:runtime-0.2.6` 镜像只接受 `navigation` 或 `mapping` 启动模式；`navigation`
+模式由独立 STARTUP 完成服务启动和首次全局重定位。STARTUP 是 NAVIGATE
+的硬前提；每条 NAVIGATE 在就绪检查后会再执行一次全局重定位并读取新鲜位姿，
+但不会重启 motion、scan 或导航容器。
 
 ## 1. 本机依赖与测试
 
@@ -18,13 +22,14 @@ pip 会自动写入 `~/.local/lib/python3.10/site-packages`：
 
 ```bash
 pip3 install -r requirements.txt
-python3 -m pytest communication_test/tests navigation_test/tests -q
+python3 -m pytest communication_test/tests navigation_test/tests startup_test/tests -q
 python3 -m unittest discover -s tests -v
 ```
 
 ## 2. ECS 升级
 
-升级前备份服务配置、注册表和 SQLite 数据库：
+升级前先确认没有活动或排队中的 STARTUP/NAVIGATE，并停止 Orsus Agent，避免新旧
+STARTUP payload 在升级窗口内混用。然后备份服务配置、注册表和 SQLite 数据库：
 
 ```bash
 sudo systemctl stop m4t-relay
@@ -61,7 +66,7 @@ sudo journalctl -u m4t-relay -n 100 --no-pager
 
 ## 3. Go2 Orsus Agent 升级
 
-构建包含 `requests` 和 `PyYAML` 的隔离依赖包，并准备私密环境文件：
+构建包含 `requests`、`PyYAML` 和 `websocket-client` 的隔离依赖包，并准备私密环境文件：
 
 ```bash
 communication_test/deploy/orsus/build_vendor_archive.sh /tmp/orsus-python-vendor.tar.gz
@@ -76,31 +81,33 @@ chmod 600 communication_test/.private/orsus-go2-agent.env
 RELAY_ALLOW_INSECURE_HTTP=true
 ```
 
-上传并安装五个输入文件：
+当电脑与 Go2 Orsus 处于同一随身 WiFi 时，可直接使用已验证的热点管理地址上传并安装：
 
 ```bash
-scp -o HostKeyAlias=orsus-go2-wired \
+scp -o HostKeyAlias=orsus-go2-5g \
   communication_test/orsus/agent.py \
   orsus_nav.py \
   communication_test/deploy/orsus/orsus-ecs-agent.service \
   communication_test/.private/orsus-go2-agent.env \
   /tmp/orsus-python-vendor.tar.gz \
-  gs@192.168.123.100:/tmp/
+  gs@192.168.0.69:/tmp/
 
-scp -o HostKeyAlias=orsus-go2-wired communication_test/deploy/orsus/install.sh \
-  gs@192.168.123.100:/tmp/install-orsus-ecs-agent.sh
+scp -o HostKeyAlias=orsus-go2-5g communication_test/deploy/orsus/install.sh \
+  gs@192.168.0.69:/tmp/install-orsus-ecs-agent.sh
 
-ssh -t -o HostKeyAlias=orsus-go2-wired gs@192.168.123.100 \
+ssh -t -o HostKeyAlias=orsus-go2-5g gs@192.168.0.69 \
   'sudo bash /tmp/install-orsus-ecs-agent.sh \
     /tmp/agent.py /tmp/orsus-go2-agent.env /tmp/orsus-ecs-agent.service \
     /tmp/orsus-python-vendor.tar.gz /tmp/orsus_nav.py'
 ```
 
-systemd 使用 `/var/lib/orsus-ecs-agent` 保存 command/mission 恢复状态。导航前确认 ECS 路由确实
-经过 `eth3`：
+systemd 使用 `/var/lib/orsus-ecs-agent` 保存 command/mission 恢复状态和
+`startup-ready.json`。该启动凭据绑定 Linux `boot_id`、设备身份、地图和导航容器；设备重启或配置
+变化后必须重新执行 STARTUP。首次升级到该版本时不会沿用旧任务文件推断 ready，部署完成后也必须
+重新执行一次 STARTUP。此流程需要 Agent `2.4.0` 或更高版本。导航前确认 ECS 路由确实经过 `eth3`：
 
 ```bash
-ssh -o HostKeyAlias=orsus-go2-wired gs@192.168.123.100 \
+ssh -o HostKeyAlias=orsus-go2-5g gs@192.168.0.69 \
   'ip -j -4 address show dev eth3; ip -j -4 route get 120.24.74.70; \
    systemctl status orsus-ecs-agent --no-pager'
 ```
@@ -116,10 +123,20 @@ Scout 使用 `orsus-ecs-agent-scout.env.example`。在其 5G 出站链路就绪�
 export RELAY_BASE_URL=http://120.24.74.70
 export RELAY_OPERATOR_TOKEN='<operator-token>'
 
+python3 -m startup_test.client --allow-insecure-http run \
+  --device-id ORSUS-GO2-GSM20260003
+
 python3 -m navigation_test.client --allow-insecure-http run \
   --device-id ORSUS-GO2-GSM20260003 \
   --x -5.303 --y 13.740 --theta -1.5987215948268056
 ```
+
+应先确认独立启动 demo 返回 `COMPLETED/ready` 和当前地图 `x/y/theta`，再运行导航测试。ECS 会
+拒绝没有成功 STARTUP 的 NAVIGATE；Agent 还会确认该 STARTUP 属于当前开机周期，并只读检查
+motion、scan、导航容器和地图。这些 STARTUP 前提通过后，NAVIGATE 会开启重定位、
+执行全局重定位、验证成功状态并从 `7997 /map_pose_odometry` 获取本次的新鲜
+`x/y/theta`，最后才提交 mission。机器人在不重启的情况下被搬动后，可直接下发
+NAVIGATE，但本次重定位失败时不会提交目标。
 
 查询或取消已有任务：
 
@@ -136,16 +153,17 @@ python3 -m navigation_test.client --allow-insecure-http cancel \
 
 默认在 `navigation_test/results/` 生成：
 
-- JSON：完整命令、导航结果、时钟校准、导航阶段耗时和 RTT 汇总。
+- JSON：完整命令、STARTUP 上下文、本次 NAVIGATE 重定位位姿、导航结果、时钟校准、
+  就绪检查/重定位/mission 耗时和 RTT 汇总。
 - CSV：全部本机-ECS请求以及 Agent 终态携带的最近 128 条 Orsus-ECS HTTP 请求原始
   RTT/成功状态；更长任务在 JSON 中保留完整窗口统计并标明截断数量。
 
 报告包含 `min/avg/p50/p95/p99/max`、命令下行、完成上行和 ECS 到本机通知时延。单向时延使用
 本机/Orsus 相对 ECS 的时钟偏移修正，并附带校准不确定度；不与机器人行驶时间混算。
 
-Go2 实机首次验收只使用清场后的短距离目标，并确认：设备在线、路由为 `eth3`、全局重定位成功、
-mission 为 `completed`、本机收到 `COMPLETED` 且 JSON 中 `passed=true`。Scout 实机验收等其 5G
-接口接入后执行同一流程。
+Go2 实机首次验收只使用清场后的短距离目标，并确认：设备在线、路由为 `eth3`、STARTUP 全局
+重定位成功、NAVIGATE 阶段再次全局重定位并返回新鲜位姿、mission 为 `completed`、本机收到
+`COMPLETED` 且 JSON 中 `passed=true`。Scout 实机验收等其 5G 接口接入后执行同一流程。
 
 自动端到端测试中的 ECS 和 SQLite 使用真实应用代码，Orsus 导航响应使用模拟控制器，因此不会
 访问公网或让机器人运动；真实 5G 时延、定位和物理到达仍只能由上述实机验收确认。

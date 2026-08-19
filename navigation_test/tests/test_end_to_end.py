@@ -15,12 +15,30 @@ from httpx import ASGITransport, AsyncClient
 from communication_test.cloud.app import create_app
 from communication_test.cloud.config import DeviceSettings, Settings as CloudSettings
 from communication_test.orsus.agent import OrsusAgent, Settings as AgentSettings
-from navigation_test.client import main
+from navigation_test.client import main as navigation_main
+from startup_test.client import main as startup_main
 
 
 OPERATOR_TOKEN = "operator-token-000000000000000000000000"
 DEVICE_TOKEN = "orsus-token-000000000000000000000000000"
 DEVICE_ID = "ORSUS-GO2-GSM20260003"
+
+
+def navigation_localization() -> dict[str, Any]:
+    return {
+        "status": "successful",
+        "map": "airs1f_3",
+        "mode": "sequential",
+        "pose": {
+            "frame_id": "GSM20260003/map",
+            "child_frame_id": "GSM20260003/base_footprint",
+            "x": 3.0,
+            "y": 4.0,
+            "theta": 0.25,
+            "source_recorded_at": "2026-08-19T00:00:00+00:00",
+            "pose_received_at": "2026-08-19T00:00:00+00:00",
+        },
+    }
 
 
 def call_asgi(app: Any, method: str, url: str, headers: dict[str, str], body: bytes | None):
@@ -101,6 +119,84 @@ class CompletedController:
             },
         }
 
+    def navigate(self, *, expected_container_id: str | None = None) -> dict[str, Any]:
+        del expected_container_id
+        localization = navigation_localization()
+        for event in (
+            {"phase": "readiness", "status": "started"},
+            {"phase": "readiness", "status": "completed"},
+            {"phase": "relocalization", "status": "started"},
+            {
+                "phase": "relocalization",
+                "status": "completed",
+                "localization": localization,
+            },
+            {"phase": "mission_submission", "status": "started"},
+            {"phase": "mission_submission", "status": "completed", "mission_id": "mission-e2e"},
+            {"phase": "mission", "status": "completed", "mission_id": "mission-e2e"},
+        ):
+            self.progress(self.name, event)
+        return {
+            "ok": True,
+            "robots": {
+                self.name: {
+                    "ok": True,
+                    "data": {
+                        "success": True,
+                        "status": "completed",
+                        "mission_id": "mission-e2e",
+                        "localization": localization,
+                    },
+                }
+            },
+        }
+
+    def startup(self) -> dict[str, Any]:
+        events = [
+            {"phase": "preflight", "status": "started"},
+            {"phase": "preflight", "status": "completed"},
+            {"phase": "motion", "status": "started"},
+            {"phase": "motion", "status": "completed"},
+            {"phase": "scan", "status": "started"},
+            {"phase": "scan", "status": "completed"},
+            {"phase": "navigation_container", "status": "started"},
+            {"phase": "navigation_container", "status": "completed"},
+            {"phase": "relocalization", "status": "started"},
+            {"phase": "relocalization", "status": "completed"},
+        ]
+        for event in events:
+            self.progress(self.name, event)
+        return {
+            "ok": True,
+            "robots": {
+                self.name: {
+                    "ok": True,
+                    "data": {
+                        "success": True,
+                        "status": "ready",
+                        "motion": {"status": "running"},
+                        "scan": {"status": "running"},
+                        "nav_container": {"running": True},
+                        "localization": {
+                            "status": "successful",
+                            "map": "airs1f_3",
+                            "mode": "sequential",
+                            "pose": {
+                                "frame_id": "GSM20260003/map",
+                                "child_frame_id": "GSM20260003/base_footprint",
+                                "x": 0.994,
+                                "y": -0.344,
+                                "theta": -0.072,
+                                "source_recorded_at": "2026-08-18T00:00:00+00:00",
+                                "pose_received_at": "2026-08-18T00:00:00+00:00",
+                            },
+                        },
+                        "navigation_status": {"relocalization": "successful"},
+                    },
+                }
+            },
+        }
+
     def resume_mission(self, _mission_id: str) -> dict[str, Any]:
         return self.run()
 
@@ -155,8 +251,9 @@ def test_pc_to_ecs_to_agent_to_orsus_and_back(tmp_path: Path) -> None:
     )
 
     def device_loop() -> None:
-        deadline = time.monotonic() + 3
-        while time.monotonic() < deadline:
+        deadline = time.monotonic() + 6
+        completed = 0
+        while time.monotonic() < deadline and completed < 2:
             command = agent.cloud_request(
                 "GET",
                 f"/v1/devices/{DEVICE_ID}/commands/next?timeout_s=0",
@@ -166,9 +263,11 @@ def test_pc_to_ecs_to_agent_to_orsus_and_back(tmp_path: Path) -> None:
                 agent.execute_command(command)
                 if agent.navigation_thread is not None:
                     agent.navigation_thread.join(timeout=3)
-                return
+                completed += 1
+                continue
             time.sleep(0.01)
-        raise AssertionError("agent did not receive the navigation command")
+        if completed != 2:
+            raise AssertionError("agent did not receive STARTUP followed by NAVIGATE")
 
     def urlopen(request: Any, timeout: float) -> UrlopenResponse:
         del timeout
@@ -181,7 +280,23 @@ def test_pc_to_ecs_to_agent_to_orsus_and_back(tmp_path: Path) -> None:
     device = threading.Thread(target=device_loop, daemon=True)
     device.start()
     with patch("navigation_test.client.urllib.request.urlopen", side_effect=urlopen):
-        exit_code = main(
+        startup_exit_code = startup_main(
+            [
+                "--base-url",
+                "http://relay.test",
+                "--token",
+                OPERATOR_TOKEN,
+                "--allow-insecure-http",
+                "--poll-interval",
+                "0.01",
+                "--output-dir",
+                str(tmp_path / "startup-reports"),
+                "run",
+                "--device-id",
+                DEVICE_ID,
+            ]
+        )
+        exit_code = navigation_main(
             [
                 "--base-url",
                 "http://relay.test",
@@ -205,9 +320,14 @@ def test_pc_to_ecs_to_agent_to_orsus_and_back(tmp_path: Path) -> None:
         )
     device.join(timeout=3)
 
+    assert startup_exit_code == 0
     assert exit_code == 0
     report_path = next((tmp_path / "reports").glob("*.json"))
     report = json.loads(report_path.read_text(encoding="utf-8"))
     assert report["passed"] is True
     assert report["command"]["result"]["mission_id"] == "mission-e2e"
+    assert report["command"]["result"]["localization"]["pose"]["x"] == 3.0
     assert report["command"]["state"] == "COMPLETED"
+    phase_seconds = report["command"]["result"]["timing"]["phase_seconds"]
+    assert "readiness" in phase_seconds
+    assert "relocalization" in phase_seconds

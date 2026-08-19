@@ -10,6 +10,7 @@ Group=gs
 WorkingDirectory=/opt/orsus-ecs-agent
 EnvironmentFile=/etc/orsus-ecs-agent.env
 Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONPATH=/opt/orsus-ecs-agent/vendor:/opt/orsus-ecs-agent
 ExecStart=/usr/bin/python3 /opt/orsus-ecs-agent/agent.py
 Restart=on-failure
 RestartSec=5

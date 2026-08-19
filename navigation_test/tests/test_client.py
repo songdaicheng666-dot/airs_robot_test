@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 import pytest
 
-from navigation_test.client import ApiError, main, require_safe_transport
+from navigation_test.client import ApiError, RelayClient, main, require_safe_transport
 from navigation_test.metrics import corrected_latency_ms, summarize_rtt
 
 
@@ -97,7 +97,7 @@ def test_status_requires_insecure_http_opt_in() -> None:
     assert exit_code == 1
 
 
-def test_run_command_writes_json_and_csv_report(tmp_path: Any) -> None:
+def test_run_command_writes_json_and_csv_report(tmp_path: Any, capsys: Any) -> None:
     now = datetime.now(tz=timezone.utc).isoformat().replace("+00:00", "Z")
     command_id = "12345678-1234-1234-1234-123456789abc"
     status_calls = 0
@@ -143,6 +143,12 @@ def test_run_command_writes_json_and_csv_report(tmp_path: Any) -> None:
                     "result": {
                         "status": "completed",
                         "mission_id": "mission-1",
+                        "target": {"x": 1.0, "y": 2.0, "theta": 0.5},
+                        "localization": {
+                            "status": "successful",
+                            "map": "airs1f_3",
+                            "pose": {"x": 3.0, "y": 4.0, "theta": -0.25},
+                        },
                         "communication_timestamps": {
                             "device_received_at": now,
                             "device_completed_at": now,
@@ -187,3 +193,120 @@ def test_run_command_writes_json_and_csv_report(tmp_path: Any) -> None:
     assert report["passed"] is True
     assert report["command"]["result"]["mission_id"] == "mission-1"
     assert report["metrics"]["pc_ecs_http"]["sample_count"] >= 8
+    output = capsys.readouterr().out
+    assert "localized before navigation: map=airs1f_3 x=3.000 y=4.000" in output
+    assert "navigation completed: mission=mission-1 target=(1.0, 2.0, 0.5)" in output
+
+
+def test_run_displays_failed_phase_and_error(tmp_path: Any, capsys: Any) -> None:
+    now = datetime.now(tz=timezone.utc).isoformat().replace("+00:00", "Z")
+    command_id = "12345678-1234-1234-1234-123456789abc"
+
+    def urlopen(request: Any, timeout: float) -> FakeHttpResponse:
+        del timeout
+        if request.full_url.endswith("/v1/time"):
+            return FakeHttpResponse({"server_time": now, "unix_time_ns": __import__("time").time_ns()})
+        if request.method == "POST" and request.full_url.endswith("/commands"):
+            return FakeHttpResponse(
+                {"command_id": command_id, "state": "QUEUED", "created_at": now},
+                201,
+            )
+        if request.method == "GET" and request.full_url.endswith(f"/v1/commands/{command_id}"):
+            return FakeHttpResponse(
+                {
+                    "command_id": command_id,
+                    "state": "FAILED",
+                    "created_at": now,
+                    "terminal_at": now,
+                    "progress": {"phase": "readiness", "phase_status": "failed"},
+                    "result": {"status": "failed", "failed_phase": "readiness"},
+                    "error": "successful STARTUP is required before NAVIGATE",
+                }
+            )
+        raise AssertionError(f"unexpected request: {request.method} {request.full_url}")
+
+    with patch("navigation_test.client.urllib.request.urlopen", side_effect=urlopen):
+        exit_code = main(
+            [
+                "--base-url",
+                "https://relay.example",
+                "--token",
+                TOKEN,
+                "--output-dir",
+                str(tmp_path),
+                "run",
+                "--x",
+                "1",
+                "--y",
+                "2",
+                "--theta",
+                "0.5",
+            ]
+        )
+
+    assert exit_code == 1
+    assert (
+        "navigation failed at readiness: successful STARTUP is required before NAVIGATE"
+        in capsys.readouterr().err
+    )
+
+
+def test_completed_navigation_without_fresh_localization_fails(
+    tmp_path: Any,
+    capsys: Any,
+) -> None:
+    now = datetime.now(tz=timezone.utc).isoformat().replace("+00:00", "Z")
+    command_id = "12345678-1234-1234-1234-123456789abc"
+    terminal = {
+        "command_id": command_id,
+        "state": "COMPLETED",
+        "created_at": now,
+        "terminal_at": now,
+        "result": {
+            "status": "completed",
+            "mission_id": "mission-1",
+            "target": {"x": 1.0, "y": 2.0, "theta": 0.5},
+        },
+    }
+
+    with (
+        patch.object(
+            RelayClient,
+            "calibrate_clock",
+            return_value={"offset_ms": 0, "uncertainty_ms": 1},
+        ),
+        patch.object(
+            RelayClient,
+            "submit",
+            return_value={"command_id": command_id, "state": "QUEUED", "created_at": now},
+        ),
+        patch(
+            "navigation_test.client.wait_for_terminal",
+            return_value=(terminal, now),
+        ),
+    ):
+        exit_code = main(
+            [
+                "--base-url",
+                "https://relay.example",
+                "--token",
+                TOKEN,
+                "--output-dir",
+                str(tmp_path),
+                "run",
+                "--x",
+                "1",
+                "--y",
+                "2",
+                "--theta",
+                "0.5",
+            ]
+        )
+
+    assert exit_code == 1
+    report = json.loads(next(tmp_path.glob("*.json")).read_text(encoding="utf-8"))
+    assert report["passed"] is False
+    assert (
+        "completed result has no fresh successful localization pose"
+        in capsys.readouterr().err
+    )

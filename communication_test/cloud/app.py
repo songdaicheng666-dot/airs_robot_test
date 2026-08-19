@@ -27,13 +27,16 @@ class StrictModel(BaseModel):
 
 class CommandCreate(StrictModel):
     client_request_id: UUID
-    type: Literal["PING", "STATUS_QUERY", "NAVIGATE", "CANCEL_NAVIGATION"]
+    type: Literal["PING", "STATUS_QUERY", "STARTUP", "NAVIGATE", "CANCEL_NAVIGATION"]
     payload: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def validate_command_payload(self) -> "CommandCreate":
         if self.type == "NAVIGATE":
             parsed = NavigatePayload.model_validate(self.payload)
+            self.payload = parsed.model_dump(mode="json")
+        elif self.type == "STARTUP":
+            parsed = StartupPayload.model_validate(self.payload)
             self.payload = parsed.model_dump(mode="json")
         elif self.type == "CANCEL_NAVIGATION":
             parsed = CancelNavigationPayload.model_validate(self.payload)
@@ -63,6 +66,10 @@ class NavigationTarget(StrictModel):
 
 class NavigatePayload(StrictModel):
     target: NavigationTarget
+
+
+class StartupPayload(StrictModel):
+    pass
 
 
 class CancelNavigationPayload(StrictModel):
@@ -178,7 +185,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     devices = settings.registered_devices
     store = RelayStore(settings.database_path, settings.command_lease_seconds, settings.command_ttl_seconds)
     command_available = asyncio.Condition()
-    app = FastAPI(title="Edge Device Cloud Relay", version="3.0.0")
+    app = FastAPI(title="Edge Device Cloud Relay", version="3.2.0")
     app.state.settings = settings
     app.state.store = store
 
@@ -265,12 +272,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         _auth: None = Depends(operator_auth),
     ) -> dict[str, Any]:
         device = require_known_device(device_id)
-        if command_request.type in {"NAVIGATE", "CANCEL_NAVIGATION"}:
+        if command_request.type in {"STARTUP", "NAVIGATE", "CANCEL_NAVIGATION"}:
             require_safe_navigation_transport(request)
             if device.kind != "orsus":
                 raise HTTPException(
                     status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                    detail="navigation commands require an Orsus device",
+                    detail="robot startup and navigation commands require an Orsus device",
                 )
         try:
             command, created = store.create_command(

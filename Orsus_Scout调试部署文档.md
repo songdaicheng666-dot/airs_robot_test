@@ -1608,6 +1608,37 @@ eth3 = 192.168.0.69/24
 其中 `120.24.74.70` 是最终 ECS，`192.168.0.1` 是随身 WiFi 的局域网网关。数据先通过
 `eth3` 交给该网关，再由随身 WiFi 经运营商网络转发到公网。这不是把 ECS 地址配置成网关。
 
+#### 6.1.1 SSH 主机密钥冲突
+
+本测试环境中，电脑还会使用 `dji@192.168.0.69` 登录妙算 3，而 Go2 Orsus 通过 5G
+随身 WiFi 访问时同样使用 `gs@192.168.0.69`。两者是不同的 SSH 主机，主机密钥也不同。
+SSH 的 `known_hosts` 默认按主机名或 IP 查找密钥，不会因登录用户分别是 `dji` 还是 `gs`。
+因此，裸 IP 下已保存妙算 3 密钥时，直接登录 Go2 可能出现：
+
+```text
+WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!
+```
+
+登录妙算 3 时继续使用裸 IP，不需要设置 `HostKeyAlias`。从仓库根目录执行：
+
+```bash
+ssh dji@192.168.0.69
+```
+
+连接 Go2 的 5G 地址时应始终使用独立别名：
+
+```bash
+ssh -o HostKeyAlias=orsus-go2-5g gs@192.168.0.69
+
+scp -o HostKeyAlias=orsus-go2-5g <local-file> \
+  gs@192.168.0.69:/tmp/
+```
+
+`HostKeyAlias` 只会让 SSH 以 `orsus-go2-5g` 名称查找和保存主机密钥，实际连接地址仍是
+`192.168.0.69`，也不会关闭主机密钥校验。首次通过 5G 连接时，应将提示的密钥指纹
+与已可信的 `orsus-go2-wired` 连接指纹比较，确认是同一台 Go2 后再接受。不要为解决该冲突
+删除裸 `192.168.0.69` 对应的妙算 3 密钥，也不要使用 `StrictHostKeyChecking=no` 绕过校验。
+
 ### 6.2 通信 Agent
 
 Agent 源码和部署资源位于：
@@ -1617,7 +1648,7 @@ communication_test/orsus/agent.py
 communication_test/deploy/orsus/
 ```
 
-它使用 Python 3.10 和 `requests 2.25.1`，作为 `orsus-ecs-agent.service` 开机启动。当前 Orsus
+它使用 Python 3.10、`requests 2.25.1` 和 `websocket-client`，作为 `orsus-ecs-agent.service` 开机启动。当前 Orsus
 的 APT 数据库因 `edge-core` 缺少 `bluez`/`dnsmasq-base` 依赖而不能安全安装
 `python3-requests`；本次将 Ubuntu 22.04 同版本的纯 Python 依赖隔离安装在
 `/opt/orsus-ecs-agent/vendor`，没有执行 `apt --fix-broken install`，也没有修改系统网络服务。
@@ -1636,9 +1667,16 @@ STATUS_QUERY
 ECS 的实际路由。各状态接口独立容错；导航容器停止导致状态查询返回 HTTP 500 时，Agent 仍会
 正常上报其他字段。
 
-新版 Agent 还可在三端安全门禁全部通过后处理 `NAVIGATE` 和 `CANCEL_NAVIGATION`，复用
-`orsus_nav.py` 的 motion/scan/nav 启动、全局重定位、任务监控和停止确认。基础 PING/STATUS_QUERY
-验证本身仍不会启动或移动 Go2；完整部署与短距离验收必须按 `navigation_test/README.md` 执行。
+新版 Agent 还可在三端安全门禁全部通过后处理 `STARTUP`、`NAVIGATE` 和
+`CANCEL_NAVIGATION`。`STARTUP` 由独立 `startup_test` demo 调用，固定完成 motion/scan/nav、全局重定位和
+`/map_pose_odometry` 位姿回传，但不提交目标。基础 PING/STATUS_QUERY 验证本身仍不会启动
+或移动 Go2；先按 `startup_test/README.md` 验证启动，再按 `navigation_test/README.md` 执行完整
+导航与短距离验收。
+
+`STARTUP/ready` 是 `NAVIGATE` 的硬前提，因为它负责开启 motion、scan 和导航容器。
+从 Agent `2.4.0` 起，每条 `NAVIGATE` 还会在这些服务就绪后再执行一次全局重定位，
+读取本次新鲜位姿后才提交 mission。STARTUP 返回的位姿只证明启动时能在地图中正常定位，
+不作为后续导航的实时起点。
 
 ### 6.3 服务检查
 
@@ -1654,4 +1692,431 @@ Agent 的私密配置是 `/etc/orsus-ecs-agent.env`，其中设备 ID 固定为
 `ORSUS-GO2-GSM20260003`，设备 Token 必须与 ECS `/etc/m4t-relay-devices.json` 中该设备的
 Token 一致。配置文件和日志不得复制到仓库或对外发送。
 
-完整的 ECS 升级、Agent 安装、导航 CLI、指标报告和回滚步骤见 `navigation_test/README.md`。
+机器人启动与自检见 `startup_test/README.md`；完整的 ECS 升级、Agent 安装、导航 CLI、指标报告
+和回滚步骤见 `navigation_test/README.md`。
+
+---
+
+## 7. M4T 与 Go2 Orsus 使用独立随身 5G 同时接入 ECS
+
+### 7.1 问题现象与首先要排除的误解
+
+2026-08-19 在 M4T 妙算 3 和 Go2 Orsus 各连接一台独立随身 5G 后，期望两台
+设备同时与 ECS 保持长轮询和心跳。初始实测中，ECS 显示 `M4T-001` 和
+`ORSUS-GO2-GSM20260003` 都不在线，并发下发的 `PING` 在 45 秒内均未完成。
+后续 `STATUS_QUERY` 停留在：
+
+```text
+state=QUEUED
+delivery_count=0
+first_delivered_at=null
+```
+
+这只说明 PC 已经把命令放入 ECS 队列，但设备端没有成功领取，不能据此认定
+“两张 5G 网互相冲突”。实际网络关系是：
+
+```text
+M4T-001 + 随身 5G A  --主动 HTTP--> ECS 的 M4T 命令队列
+Orsus    + 随身 5G B  --主动 HTTP--> ECS 的 Orsus 命令队列
+PC                         --公网 HTTP--> ECS
+```
+
+两个随身 5G 各自做 NAT，即使两个局域网都使用 `192.168.0.0/24`，甚至给终端分配
+相同私网地址，也不会在 ECS 上互相冲突。ECS 按 `device_id` 和专用 Device Token
+区分设备，不按随身 5G 的 IMEI、SIM 卡或公网出口 IP 区分设备。
+
+因此，更换随身 5G 后要同时做两类检查：先重新发现本机 IP、网口和默认路由，
+再检查 Relay/Agent 是否在运行。不能继续使用旧随身 5G 下记录的 IP 或网口名。
+
+设备注册方面：
+
+- 只更换同一台 M4T 的随身 5G，不需要在 ECS 新增设备注册。
+- 只有增加新的物理 M4T 或 Orsus 设备时，才需要为它分配新的 `device_id` 和
+  Device Token，并加入 ECS `/etc/m4t-relay-devices.json`。
+- 多台物理设备不得共用同一个 `device_id`，否则会竞争领取同一队列的命令。
+
+### 7.2 更换随身 5G 后必须重新确认 IP、网口和路由
+
+随身 5G 通常通过 DHCP 给接入设备分配地址。换成另一台随身 5G 后，地址池、租约、
+网关以及连接方式都可能变化。本次最直观的变化是：
+
+```text
+旧随身 5G 下记录的妙算地址: 192.168.0.69
+新随身 5G 实际分配的妙算地址: 192.168.0.42
+新随身 5G 上的妙算网口:       eth0
+```
+
+因此继续执行 `ssh dji@192.168.0.69` 必然无法登录当前妙算。这不是 SSH 密钥、
+ECS 注册或 Token 问题，而是管理目标地址已经过期。新地址应从以下任一可信来源重新
+确认：
+
+1. 随身 5G 管理页中的 DHCP/已连接客户端列表。
+2. 妙算本地终端的 `ip -br address`。
+3. 无人机有线 USB 管理链路，本次使用 `192.168.42.120` 转入妙算。
+4. 同一局域网中的受控主机发现，但必须核对 SSH 主机指纹，不能仅根据 IP 猜测设备身份。
+
+网口名也不是随身 5G 的永久身份。根据 WiFi、USB RNDIS、USB 以太网或普通有线接入
+方式，Linux 上可能出现 `wlan0`、`eth0`、`eth3`、`rndis0` 或 `enx...`。查验时应每次
+现场执行：
+
+```bash
+ip -br address
+ip route
+ip route get 120.24.74.70
+```
+
+以 `ip route get` 返回的 `dev`、`src` 和 `via` 为准，不要从旧文档复制网口名。
+如果自动化脚本、systemd 服务或环境变量写死了旧网口，更换 5G 后必须同步修改。
+特别是 Orsus Agent 使用：
+
+```text
+ORSUS_NETWORK_INTERFACE=eth3
+```
+
+如果 Orsus 更换接入方式后实际网口不再是 `eth3`，必须更新
+`/etc/orsus-ecs-agent.env` 并重启 `orsus-ecs-agent`。M4T 当前的 C Relay 没有将 libcurl
+绑定到固定网口，它使用系统默认路由；因此 M4T 从 `.69` 变为 `.42` 本身不需要修改
+ECS 配置，但会直接影响 SSH 管理和任何写死旧 IP/网口的脚本。
+
+需要稳定管理地址时，应在每台随身 5G 上根据妙算网卡 MAC 配置 DHCP 保留，而不是
+在妙算上盲目写死一个可能与新网关地址池冲突的静态 IP。
+
+### 7.3 本次 ECS 离线的实际根因
+
+电脑连入 M4T 的新随身 5G 后，局域网和公网均正常：
+
+```text
+PC WiFi:       192.168.0.181/24
+5G gateway:    192.168.0.1
+M4T eth0:      192.168.0.42/24
+ECS route:     120.24.74.70 via 192.168.0.1 dev eth0 src 192.168.0.42
+ECS /health:   {"status":"ok"}
+```
+
+这证明新随身 5G 已经给妙算分配 DHCP 地址，且妙算可以通过它访问 ECS。真正问题在
+PSDK 应用层：
+
+```text
+/vendor_app/Smart3DExplore/bin/Smart3DExplore
+```
+
+当时运行的是 `Smart3DExplore`，`dji_sdk_demo_on_manifold3` 没有运行；
+`airs-5g-relay` DPK 虽然已经构建在妙算上，但没有安装和启用开机自启。妙算 3 同一时间
+只能运行一个 PSDK 应用，所以即使 5G 网络完全正常，ECS 也收不到 M4T 心跳。
+
+本次故障包含两个必须分开记录的问题：
+
+1. 更换随身 5G 直接导致妙算地址从 `.69` 变为 `.42`，原 SSH 目标失效，并且任何写死
+   旧 IP/网口的配置都可能失效。
+2. 本次在 `.42` 上实测 ECS 路由和 `/health` 已经正常，所以最终造成 M4T 在 ECS 离线的
+   原因是 Relay 未运行，不是 `.42` 这个新地址本身。
+
+本次“新增随身 5G 后不能同时通信”的完整结论是：
+
+> 两条独立 5G 链路的设计没有冲突。M4T 离线的根因是 Cloud Relay 未成为开机运行的
+> PSDK 应用，而不是新 5G 设备缺少 ECS 注册。
+
+### 7.4 通过有线链路登录妙算
+
+新随身 5G 下原来的 `192.168.0.69` 不再是妙算地址。本次通过无人机有线 USB 管理
+链路登录：
+
+```text
+PC:                192.168.42.1/24
+有线 SSH 映射地址: 192.168.42.120
+妙算 rndis0:      192.168.42.2/24
+```
+
+电脑上 USB 以太网接口名在不同启动中可能变化，不应把
+`enxba488ef20e1b` 或 `enx26d2556ba2f6` 写死到脚本。应使用地址和路由判断链路。
+
+首次改用 `192.168.42.120` 前，先将其 ED25519 指纹与已信任的妙算地址指纹比较。
+本次两者指纹一致，因此可复用原主机身份记录：
+
+```bash
+ssh -i communication_test/.private/m4t_test_ed25519 \
+  -o IdentitiesOnly=yes \
+  -o HostKeyAlias=192.168.0.69 \
+  dji@192.168.42.120
+```
+
+不要为了快速登录而使用 `StrictHostKeyChecking=no`。
+
+### 7.5 标准排查顺序
+
+先从 PC 查 ECS 服务和设备心跳：
+
+```bash
+export RELAY_BASE_URL=http://120.24.74.70
+export RELAY_OPERATOR_TOKEN='<operator-token>'
+
+python3 -m communication_test.pc.client devices
+python3 -m communication_test.pc.client --device-id M4T-001 status
+python3 -m communication_test.pc.client \
+  --device-id ORSUS-GO2-GSM20260003 status
+```
+
+`online=false` 仅表示 ECS 在在线阈值内没有收到新遥测。状态页中的遥测可能是旧缓存，
+必须同时检查 `last_seen_at`。为了验证命令回路，只使用不会运动的命令：
+
+```bash
+python3 -m communication_test.pc.client \
+  --device-id M4T-001 send --type PING --payload '{"message":"m4t-link-test"}'
+
+python3 -m communication_test.pc.client \
+  --device-id ORSUS-GO2-GSM20260003 \
+  send --type PING --payload '{"message":"orsus-link-test"}'
+```
+
+如果 PC 可以把命令提交到 ECS，但命令持续为 `QUEUED` 且 `delivery_count=0`，转到设备端
+检查。M4T 妙算上执行：
+
+```bash
+ip -br address
+ip route
+ip route get 120.24.74.70
+python3 -c "import urllib.request; print(urllib.request.urlopen('http://120.24.74.70/health', timeout=10).read().decode())"
+ps -ef | grep -E 'dji_sdk_demo_on_manifold3|Smart3DExplore' | grep -v grep
+dji_app_ctl list
+dji_app_ctl status
+```
+
+结果的分层判断方法：
+
+| 结果 | 含义 | 下一步 |
+| --- | --- | --- |
+| 没有 DHCP 地址 | 妙算没有接入新 5G 局域网 | 检查网线/USB、5G 供电、DHCP 和网络配置 |
+| `ip route get` 失败 | 没有到 ECS 的默认路由 | 检查 5G 网关、SIM/APN 和默认路由 |
+| `/health` 失败 | 5G 公网或 ECS 入口不可达 | 先修复网络，不要继续查 PSDK |
+| `/health` 成功，无 Relay 进程 | 网络正常，PSDK Relay 未启动 | 检查 DPK 安装和开机自启 |
+| HTTP `401` | `device_id` 已存在，但 Device Token 不匹配 | 对照 ECS 注册表和妙算私密配置 |
+| HTTP `404` | ECS 不认识该 `device_id` | 为新的物理设备注册唯一 ID/Token |
+| 进程存在但遥测不更新 | 可能卡在 PSDK 初始化或配置加载 | 查应用日志，不以 `ps` 单独作为验收依据 |
+
+Orsus 端则检查：
+
+```bash
+ip route get 120.24.74.70
+systemctl status orsus-ecs-agent --no-pager
+journalctl -u orsus-ecs-agent -n 100 --no-pager
+```
+
+### 7.6 M4T Relay 临时验证和持久化修复
+
+安装前先做临时验证，确认现有二进制、私密配置和 ECS 设备身份可以正常工作。
+无人机必须已落地且电机关闭：
+
+```bash
+dji_app_ctl stop Smart3DExplore
+
+cd /home/dji/m4t-communication-test/native-build/run
+./dji_sdk_demo_on_manifold3
+```
+
+正常日志应包含：
+
+```text
+Identify AircraftType = Matrice 4T
+M4T relay configured for M4T-001 at http://120.24.74.70
+M4T cloud relay service started; flight-control commands are disabled
+```
+
+在 PC 端确认 M4T `online=true`、`psdk_connected=true`，且 `PING` 和
+`STATUS_QUERY` 都进入 `COMPLETED` 后，再停止临时进程并安装 DPK：
+
+```bash
+package=/home/dji/m4t-communication-test/native-build/source/build-m4t-relay/dpk/airs-5g-relay_v01.00.00.00.dpk
+
+dji_app_ctl install -i "$package"
+dji_app_ctl disable Smart3DExplore
+dji_app_ctl enable airs-5g-relay
+dji_app_ctl start airs-5g-relay
+```
+
+`Smart3DExplore` 和 `airs-5g-relay` 不能同时作为启动中的 PSDK 应用。上述配置会让
+Cloud Relay 成为默认开机应用，同时意味着 `Smart3DExplore` 不再自动启动。需要恢复
+后者时，必须明确停止/禁用 Relay，再启用 `Smart3DExplore`，不得将两者同时设为自启。
+
+`dji_app_ctl status` 在应用刚启动时曾短暂显示 `Not Running`，但进程已经存在。验收时
+必须同时确认：
+
+```bash
+dji_app_ctl status airs-5g-relay
+ps -ef | grep dji_sdk_demo_on_manifold3 | grep -v grep
+python3 -m communication_test.pc.client --device-id M4T-001 status
+```
+
+### 7.7 冷启动和双设备实测结果
+
+安装并启用 Relay 后，现场完全重启无人机/妙算。开机约 2 分钟后的实测结果为：
+
+```text
+eth0: 192.168.0.42/24
+route: 120.24.74.70 via 192.168.0.1 dev eth0 src 192.168.0.42
+process: /open_app/airs-5g-relay/bin/dji_sdk_demo_on_manifold3
+dji_app_ctl status: Running
+Smart3DExplore/weishi process: none
+```
+
+ECS 同时显示：
+
+```text
+M4T-001                    online=true
+ORSUS-GO2-GSM20260003      online=true
+```
+
+冷启动后分别下发独立 `PING`，两条命令都仅被对应设备领取一次，并进入
+`COMPLETED`：
+
+| 设备 | 返回身份 | 从 ECS 创建到终态的时间 |
+| --- | --- | --- |
+| `M4T-001` | `pong`，原样返回 M4T 测试标记 | 约 0.35 s |
+| `ORSUS-GO2-GSM20260003` | `pong`，SN `GSM20260003`，Agent `2.2.0` | 约 0.18 s |
+
+M4T 实时遥测同时显示 `psdk_connected=true`、飞行状态 `STOPPED`。这次冷启动验收
+证明两台设备可以各自通过独立随身 5G 同时与 ECS 保持心跳和命令回路。
+
+注意，“Orsus 在线”只证明 Agent/ECS 通信正常。本次验收时 Orsus 的 motion 为
+`stopped`、导航容器为 `exited`、scan 为 `degraded`，不能据此认定 Go2 已经具备运动或
+导航条件。运动前仍必须执行 `startup_test` 自检。
+
+### 7.8 妙算时钟遗留问题
+
+冷启动后妙算的系统时间仍停在 `2026-07-25`，且：
+
+```text
+System clock synchronized: no
+NTP service: inactive
+```
+
+ECS 的 `last_seen_at` 使用服务端收到遥测的时间，所以当前 HTTP 在线判断仍正常；M4T
+遥测中的 `recorded_at` 会因设备时钟错误而不可信。切换 HTTPS 前必须使用妙算管理权限启用
+时间同步：
+
+```bash
+sudo timedatectl set-ntp true
+timedatectl status
+```
+
+验收时应确认 `System clock synchronized: yes`，再部署 HTTPS 证书和主机名校验。
+
+## 8. STARTUP/NAVIGATION 通信指标与 Relay 变量命名
+
+### 8.1 指标测量的是哪一段
+
+STARTUP 和 NAVIGATION 报告将“HTTP 往返时间”、“单向应用交接时间”和
+“机器人任务执行时间”分开。三者的起止点不同，不能都理解为 5G 网络的
+纯传输时延。
+
+```text
+PC                     ECS                         Orsus Agent          Edge Core / Go2
+ |--- HTTP request ---->|--- command delivery ----->|--- navigation ----->|
+ |<-- HTTP response ----|<-- state/result upload ----|<-- completed -------|
+ |--- status polling -->|                            |
+ |<-- terminal state ---|                            |
+```
+
+| 报告字段 | 开始时刻 | 结束时刻 | 实际包含的内容 |
+| --- | --- | --- | --- |
+| `pc_ecs_http` | PC 开始一次 HTTP 请求 | PC 收完 ECS HTTP 响应 | PC 本地协议栈、PC 网络、公网上下行、Nginx/ECS 处理和响应传输的整个往返 |
+| `orsus_ecs_http` | Agent 发起一次非长轮询 HTTP 请求 | Agent 收到 ECS HTTP 响应 | Orsus 系统协议栈、随身 5G、公网、Nginx/ECS 处理和响应传输的整个往返 |
+| `ecs_to_device_command` | ECS 创建命令 | Agent 记录已收到命令 | ECS 排队/投递等待、ECS 到 Orsus 的传输以及 Agent 取出命令前的处理；它不是纯下行网络时延 |
+| `device_to_ecs_terminal` | Agent 记录任务完成 | ECS 写入命令终态 | Agent 构造结果、Orsus 到 ECS 上行传输及 ECS 落库处理 |
+| `ecs_to_pc_notification` | ECS 写入终态 | PC 轮询读到该终态 | 等待 PC 下一次轮询、ECS 查询和 ECS 到 PC 的 HTTP 往返；默认轮询间隔为 0.5 s，所以该值常接近数百毫秒 |
+| `startup_timing` / `navigation_timing` | Agent 开始处理任务 | Agent 确认任务终态 | 机器人端自检、启动、重定位、mission 提交或行驶的应用耗时，不与上述通信时延混算 |
+
+`pc_ecs_http` 的样本包括校时、命令提交和状态轮询等 PC/ECS 请求。
+`orsus_ecs_http` 使用该任务时间窗口内的 Agent/ECS 非长轮询请求，可包含校时、
+进度/终态上传和心跳遥测。因此，两个 RTT 统计都不是 ICMP `ping`，也不是只测
+无线空口的 5G 时延。
+
+### 8.2 RTT 和各统计值的含义
+
+RTT（Round-Trip Time）是“请求从发起端出发，到达对端并获得完整响应”的往返时间。
+代码使用单调时钟 `time.perf_counter()` 测量 RTT，系统时间校正不会让这类测量突然
+跳变。
+
+| 字段 | 含义 | 如何阅读 |
+| --- | --- | --- |
+| `sample_count` | 总请求数 | 成功与失败样本之和 |
+| `success_count` | HTTP 2xx 请求数 | 只有这些样本进入 RTT 分布统计 |
+| `failure_count` | 网络异常或非 2xx 请求数 | 即使 RTT 很低，失败数不为 0 也需要单独排查 |
+| `min` | 最小成功 RTT | 接近本次测试的最佳情况 |
+| `avg` | 所有成功 RTT 的算术平均 | 容易被少数很慢的请求拉高 |
+| `p50` | 第 50 百分位，即中位数 | 大约一半成功请求不超过此值，反映“典型一次” |
+| `p95` | 第 95 百分位 | 大约 95% 的成功请求不超过此值，适合观察常见尾延迟 |
+| `p99` | 第 99 百分位 | 大约 99% 的成功请求不超过此值，小样本时很接近 `max` |
+| `max` | 最大成功 RTT | 本次测试观测到的最慢成功请求 |
+
+百分位只对成功样本排序并做线性插值。例如，`p95=208 ms` 表示本次样本中
+约 95% 的成功请求在 208 ms 内完成，不表示每次固定需要 208 ms。只有 24 或
+45 个样本时，`p99` 只能描述这一次短测试，不能作为长期网络 SLA。
+
+### 8.3 单向时延的时钟校准和误差
+
+RTT 在同一台机器上记录起止时间，不需要 PC、ECS 和 Orsus 的时钟一致。
+三个单向应用时延跨设备比较 UTC 时间戳，所以 PC 和 Agent 会分别请求 ECS
+`/v1/time` 5 次，选择 RTT 最小的样本，以请求前后的本地时刻中点估计偏移。
+
+```text
+offset_ms      = ECS 时间 - 本地中点时间
+uncertainty_ms = 该次校时 RTT / 2
+```
+
+这种算法默认上下行大致对称。例如 Orsus 校时不确定度为 `27.943 ms` 时，
+`ecs_to_device_command=35.501 ms` 应理解为“经校正后估计约 35.5 ms，但校时本身带有
+约 27.9 ms 的不确定度”，而不是精确到 0.001 ms。
+
+### 8.4 形象理解：快递、签收与查件
+
+可以把 PC、ECS 和 Orsus 看成三个站点：
+
+- `PC ↔ ECS RTT` 是 PC 寄一封信给 ECS，ECS 处理后寄回回执，手里的秒表记录整个来回。
+- `Orsus ↔ ECS RTT` 是 Orsus 通过随身 5G 寄信并拿回回执。这个数字包含云端拆信和写回执的时间，不只是快递车在路上的时间。
+- `命令下行` 是 ECS 盖上“已发件”时间，到 Orsus 盖上“已签收”时间。
+- `完成结果上行` 是 Orsus 盖上“已完成”时间，到 ECS 把该结果登记入库的时间。
+- `ECS 到 PC 通知` 不是 ECS 主动打电话。当前 PC 每 0.5 s 查一次件，因此快递其实已入库，PC 也可能要等到下一次查件才知道。
+
+这也解释了为什么某次 STARTUP 中 `PC ↔ ECS` 平均 RTT 约为 `143.6 ms`，
+而 `ECS 到 PC 通知` 却约为 `492.2 ms`：后者主要还包含等待下一轮 0.5 s 查询的时间，
+不能据此认为 PC/ECS 网络单程需要 492.2 ms。
+
+### 8.5 为什么 Go2 Orsus 测试中会看到 `M4T_*`
+
+这些名称是 ECS Relay 最初为 Matrice 4T 通信测试开发时留下的历史命名。
+现在同一个 ECS Relay 已扩展为多设备中继，设备注册表同时支持 `kind=m4t` 和
+`kind=orsus`，但 ECS 服务名、配置文件和部分环境变量还没有全面改名。
+
+在以下命令中：
+
+```bash
+source communication_test/.private/m4t-relay.env
+export RELAY_OPERATOR_TOKEN="$M4T_OPERATOR_TOKEN"
+```
+
+第一行只是从历史命名的本机私密文件读取 ECS Operator Token；第二行把 ECS 程序
+仍使用的变量名 `M4T_OPERATOR_TOKEN` 映射为通用 CLI 使用的
+`RELAY_OPERATOR_TOKEN`。它不会启动 M4T、不会选中无人机，也不会让 Go2 命令经过妙算。
+
+本次 Go2 命令的真正路由选择来自：
+
+```text
+--device-id ORSUS-GO2-GSM20260003
+```
+
+ECS 根据该 ID 在设备注册表中找到 `kind=orsus` 和 Go2 专用 Device Token，
+然后只允许身份匹配的 Orsus Agent 领取命令。各凭据的边界如下：
+
+| 凭据 | 使用者 | 用途 | 是否针对本次 Go2 |
+| --- | --- | --- | --- |
+| ECS Operator Token（现有服务端变量名为 `M4T_OPERATOR_TOKEN`） | PC CLI | 创建和查询已注册设备的命令 | 是，但它是共享 ECS 操作凭据，不是 M4T 设备凭据 |
+| Go2 `RELAY_DEVICE_TOKEN` | Go2 Orsus Agent | 上报遥测、领取 Go2 命令和回传状态 | 是，且只属于 Go2 Orsus |
+| `M4T_DEVICE_TOKEN` | M4T Relay | M4T 遥测和 M4T 命令认证 | 否 |
+
+因此，当前 Go2 实测链路仍然是：
+
+```text
+PC navigation/startup CLI -> ECS Relay -> Go2 Orsus Agent -> Edge Core / Go2
+```
+
+文件名中的 `m4t-relay` 和 Operator Token 的 `M4T_` 前缀只是历史命名，不是数据路由。

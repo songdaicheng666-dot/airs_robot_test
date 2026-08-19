@@ -102,6 +102,23 @@ def ip_runner(command: list[str], **_kwargs: Any) -> subprocess.CompletedProcess
     return subprocess.CompletedProcess(command, 0, json.dumps(output), "")
 
 
+def successful_localization(*, x: float = 3.0, y: float = 4.0) -> dict[str, Any]:
+    return {
+        "status": "successful",
+        "map": "airs1f_3",
+        "mode": "sequential",
+        "pose": {
+            "frame_id": "GSM20260003/map",
+            "child_frame_id": "GSM20260003/base_footprint",
+            "x": x,
+            "y": y,
+            "theta": -0.25,
+            "source_recorded_at": "2026-08-19T00:00:00+00:00",
+            "pose_received_at": "2026-08-19T00:00:00+00:00",
+        },
+    }
+
+
 def test_collects_complete_status_and_isolates_navigation_error() -> None:
     local = FakeSession(local_handler(navigation_status=500))
     cloud = FakeSession(lambda *_args, **_kwargs: FakeResponse({}))
@@ -214,8 +231,13 @@ class FakeNavigationController:
         self.stop_event = threading.Event()
         self.closed = False
         self.resume_ids: list[str] = []
+        self.run_calls = 0
+        self.navigate_calls = 0
+        self.expected_container_ids: list[str | None] = []
+        self.startup_calls = 0
 
     def run(self) -> dict[str, Any]:
+        self.run_calls += 1
         self.progress_callback(self.robot_name, {"phase": "preflight", "status": "started"})
         self.progress_callback(self.robot_name, {"phase": "preflight", "status": "completed"})
         self.progress_callback(
@@ -232,6 +254,98 @@ class FakeNavigationController:
                 self.robot_name: {
                     "ok": True,
                     "data": {"success": True, "status": "completed", "mission_id": "mission-1"},
+                }
+            },
+        }
+
+    def navigate(self, *, expected_container_id: str | None = None) -> dict[str, Any]:
+        self.navigate_calls += 1
+        self.expected_container_ids.append(expected_container_id)
+        localization = successful_localization()
+        self.progress_callback(self.robot_name, {"phase": "readiness", "status": "started"})
+        self.progress_callback(self.robot_name, {"phase": "readiness", "status": "completed"})
+        self.progress_callback(
+            self.robot_name,
+            {"phase": "relocalization", "status": "started"},
+        )
+        self.progress_callback(
+            self.robot_name,
+            {
+                "phase": "relocalization",
+                "status": "completed",
+                "localization": localization,
+            },
+        )
+        self.progress_callback(
+            self.robot_name,
+            {"phase": "mission_submission", "status": "started"},
+        )
+        self.progress_callback(
+            self.robot_name,
+            {"phase": "mission_submission", "status": "completed", "mission_id": "mission-1"},
+        )
+        self.progress_callback(
+            self.robot_name,
+            {"phase": "mission", "status": "completed", "mission_id": "mission-1"},
+        )
+        return {
+            "ok": True,
+            "robots": {
+                self.robot_name: {
+                    "ok": True,
+                    "data": {
+                        "success": True,
+                        "status": "completed",
+                        "mission_id": "mission-1",
+                        "localization": localization,
+                    },
+                }
+            },
+        }
+
+    def startup(self) -> dict[str, Any]:
+        self.startup_calls += 1
+        events = [
+            {"phase": "preflight", "status": "started"},
+            {"phase": "preflight", "status": "completed"},
+            {"phase": "motion", "status": "started"},
+            {"phase": "motion", "status": "completed"},
+            {"phase": "scan", "status": "started"},
+            {"phase": "scan", "status": "completed"},
+            {"phase": "navigation_container", "status": "started"},
+            {"phase": "navigation_container", "status": "completed"},
+            {"phase": "relocalization", "status": "started"},
+            {"phase": "relocalization", "status": "completed"},
+        ]
+        for event in events:
+            self.progress_callback(self.robot_name, event)
+        return {
+            "ok": True,
+            "robots": {
+                self.robot_name: {
+                    "ok": True,
+                    "data": {
+                        "success": True,
+                        "status": "ready",
+                        "motion": {"status": "running"},
+                        "scan": {"status": "running"},
+                        "nav_container": {"running": True},
+                        "localization": {
+                            "status": "successful",
+                            "map": "airs1f_3",
+                            "mode": "sequential",
+                            "pose": {
+                                "frame_id": "GSM20260003/map",
+                                "child_frame_id": "GSM20260003/base_footprint",
+                                "x": 0.994,
+                                "y": -0.344,
+                                "theta": -0.072,
+                                "source_recorded_at": "2026-08-18T00:00:00+00:00",
+                                "pose_received_at": "2026-08-18T00:00:00+00:00",
+                            },
+                        },
+                        "navigation_status": {"relocalization": "successful"},
+                    },
                 }
             },
         }
@@ -261,10 +375,52 @@ class BlockingNavigationController(FakeNavigationController):
             "robots": {self.robot_name: {"ok": False, "error": "interrupted"}},
         }
 
+    def navigate(self, *, expected_container_id: str | None = None) -> dict[str, Any]:
+        del expected_container_id
+        return self.run()
+
     def cancel_active_operations(self, *, stop_navigation: bool = False) -> dict[str, Any]:
         self.stop_event.set()
         self.release.set()
         return {"ok": stop_navigation, "missions": {}, "relocalizations": {}}
+
+
+class MissingLocalizationController(FakeNavigationController):
+    def startup(self) -> dict[str, Any]:
+        self.startup_calls += 1
+        return {
+            "ok": True,
+            "robots": {
+                self.robot_name: {
+                    "ok": True,
+                    "data": {"success": True, "status": "ready"},
+                }
+            },
+        }
+
+
+class MissingNavigationLocalizationController(FakeNavigationController):
+    def navigate(self, *, expected_container_id: str | None = None) -> dict[str, Any]:
+        self.navigate_calls += 1
+        self.expected_container_ids.append(expected_container_id)
+        self.progress_callback(self.robot_name, {"phase": "readiness", "status": "completed"})
+        self.progress_callback(
+            self.robot_name,
+            {"phase": "mission_submission", "status": "completed", "mission_id": "mission-1"},
+        )
+        self.progress_callback(
+            self.robot_name,
+            {"phase": "mission", "status": "completed", "mission_id": "mission-1"},
+        )
+        return {
+            "ok": True,
+            "robots": {
+                self.robot_name: {
+                    "ok": True,
+                    "data": {"success": True, "status": "completed", "mission_id": "mission-1"},
+                }
+            },
+        }
 
 
 def navigation_cloud_handler(state_updates: list[tuple[str, dict[str, Any]]]):
@@ -295,6 +451,129 @@ def navigation_command(command_id: str = "nav-command") -> dict[str, Any]:
     }
 
 
+def startup_command(command_id: str = "startup-command") -> dict[str, Any]:
+    return {
+        "command_id": command_id,
+        "client_request_id": "startup-request-1",
+        "created_at": datetime.now(tz=timezone.utc).isoformat(),
+        "type": "STARTUP",
+        "payload": {},
+    }
+
+
+def prime_startup_ready(agent: OrsusAgent) -> None:
+    agent._save_startup_state(
+        {
+            "schema_version": 1,
+            "status": "ready",
+            "command_id": "startup-command",
+            "completed_at": datetime.now(tz=timezone.utc).isoformat().replace("+00:00", "Z"),
+            "boot_id": agent._boot_id(),
+            "device_id": agent.settings.device_id,
+            "expected_sn": agent.settings.expected_sn,
+            "robot_name": agent.settings.robot_name,
+            "adapter_type": agent.settings.adapter_type,
+            "scene_name": agent.settings.scene_name,
+            "bringup_mode": agent.settings.bringup_mode,
+            "container_id": "container-1",
+            "localization": {
+                "status": "successful",
+                "map": agent.settings.scene_name,
+                "pose": {"x": 1.0, "y": 2.0, "theta": 0.5},
+            },
+        }
+    )
+
+
+def test_startup_relocalizes_without_submitting_mission(tmp_path: Any) -> None:
+    updates: list[tuple[str, dict[str, Any]]] = []
+    controllers: list[FakeNavigationController] = []
+
+    def factory(*args: Any, **kwargs: Any) -> FakeNavigationController:
+        controller = FakeNavigationController(*args, **kwargs)
+        controllers.append(controller)
+        return controller
+
+    agent = OrsusAgent(
+        settings(
+            allow_insecure_http=True,
+            navigation_state_path=tmp_path / "startup.json",
+        ),
+        cloud_session=FakeSession(navigation_cloud_handler(updates)),
+        local_session=FakeSession(local_handler()),
+        command_runner=ip_runner,
+        controller_factory=factory,
+    )
+
+    agent.execute_command(startup_command())
+    assert agent.navigation_thread is not None
+    agent.navigation_thread.join(timeout=3)
+
+    states = [payload["state"] for command_id, payload in updates if command_id == "startup-command"]
+    assert states[0] == "RECEIVED"
+    assert "RUNNING" in states
+    assert states[-1] == "COMPLETED"
+    result = updates[-1][1]["result"]
+    assert result["operation"] == "startup"
+    assert result["status"] == "ready"
+    assert result["mission_id"] is None
+    assert result["target"] is None
+    assert result["localization"]["status"] == "successful"
+    assert result["localization"]["pose"]["x"] == 0.994
+    assert result["startup_report"]["robots"]["go2"]["data"]["nav_container"]["running"] is True
+    assert controllers[0].startup_calls == 1
+    assert controllers[0].run_calls == 0
+    startup_state = json.loads((tmp_path / "startup-ready.json").read_text(encoding="utf-8"))
+    assert startup_state["status"] == "ready"
+    assert startup_state["command_id"] == "startup-command"
+
+
+def test_startup_rejects_legacy_relocalize_payload(tmp_path: Any) -> None:
+    updates: list[tuple[str, dict[str, Any]]] = []
+    agent = OrsusAgent(
+        settings(
+            allow_insecure_http=True,
+            navigation_state_path=tmp_path / "startup.json",
+        ),
+        cloud_session=FakeSession(navigation_cloud_handler(updates)),
+        local_session=FakeSession(local_handler()),
+        command_runner=ip_runner,
+        controller_factory=FakeNavigationController,
+    )
+    command = startup_command()
+    command["payload"] = {"relocalize": False}
+
+    agent.execute_command(command)
+
+    assert agent.navigation_thread is None
+    assert updates[-1][1]["state"] == "FAILED"
+    assert updates[-1][1]["error"] == "STARTUP payload must be an empty object"
+
+
+def test_startup_without_localization_pose_is_failed(tmp_path: Any) -> None:
+    updates: list[tuple[str, dict[str, Any]]] = []
+    agent = OrsusAgent(
+        settings(
+            allow_insecure_http=True,
+            navigation_state_path=tmp_path / "startup.json",
+        ),
+        cloud_session=FakeSession(navigation_cloud_handler(updates)),
+        local_session=FakeSession(local_handler()),
+        command_runner=ip_runner,
+        controller_factory=MissingLocalizationController,
+    )
+
+    agent.execute_command(startup_command())
+    assert agent.navigation_thread is not None
+    agent.navigation_thread.join(timeout=3)
+
+    assert updates[-1][1]["state"] == "FAILED"
+    assert updates[-1][1]["result"]["status"] == "localization_missing"
+    assert updates[-1][1]["error"] == (
+        "startup completed without a successful localization pose"
+    )
+
+
 def test_navigation_runs_in_background_and_reports_completed(tmp_path: Any) -> None:
     updates: list[tuple[str, dict[str, Any]]] = []
     agent = OrsusAgent(
@@ -308,6 +587,7 @@ def test_navigation_runs_in_background_and_reports_completed(tmp_path: Any) -> N
         controller_factory=FakeNavigationController,
     )
 
+    prime_startup_ready(agent)
     agent.execute_command(navigation_command())
     assert agent.navigation_thread is not None
     agent.navigation_thread.join(timeout=3)
@@ -319,8 +599,58 @@ def test_navigation_runs_in_background_and_reports_completed(tmp_path: Any) -> N
     result = updates[-1][1]["result"]
     assert result["status"] == "completed"
     assert result["mission_id"] == "mission-1"
+    assert result["localization"]["pose"]["x"] == 3.0
+    assert result["startup_context"]["command_id"] == "startup-command"
+    assert agent.navigation_thread is not None
+    assert agent.navigation_thread.name.startswith("navigate-")
+    assert agent.active_controller is None
     persisted = json.loads((tmp_path / "navigation.json").read_text(encoding="utf-8"))
     assert persisted["terminal_acknowledged"] is True
+
+
+def test_navigation_without_fresh_localization_pose_is_failed(tmp_path: Any) -> None:
+    updates: list[tuple[str, dict[str, Any]]] = []
+    agent = OrsusAgent(
+        settings(
+            allow_insecure_http=True,
+            navigation_state_path=tmp_path / "navigation.json",
+        ),
+        cloud_session=FakeSession(navigation_cloud_handler(updates)),
+        local_session=FakeSession(local_handler()),
+        command_runner=ip_runner,
+        controller_factory=MissingNavigationLocalizationController,
+    )
+    prime_startup_ready(agent)
+
+    agent.execute_command(navigation_command())
+    assert agent.navigation_thread is not None
+    agent.navigation_thread.join(timeout=3)
+
+    assert updates[-1][1]["state"] == "FAILED"
+    assert updates[-1][1]["result"]["status"] == "localization_missing"
+    assert updates[-1][1]["error"] == (
+        "navigation completed without a fresh successful localization pose"
+    )
+
+
+def test_navigation_requires_successful_startup_in_current_boot(tmp_path: Any) -> None:
+    updates: list[tuple[str, dict[str, Any]]] = []
+    agent = OrsusAgent(
+        settings(
+            allow_insecure_http=True,
+            navigation_state_path=tmp_path / "navigation.json",
+        ),
+        cloud_session=FakeSession(navigation_cloud_handler(updates)),
+        local_session=FakeSession(local_handler()),
+        command_runner=ip_runner,
+        controller_factory=FakeNavigationController,
+    )
+
+    agent.execute_command(navigation_command())
+
+    assert agent.navigation_thread is None
+    assert updates[-1][1]["state"] == "FAILED"
+    assert "successful STARTUP is required" in updates[-1][1]["error"]
 
 
 def test_terminal_result_is_bounded_without_losing_summary_fields() -> None:
@@ -439,6 +769,7 @@ def test_cancel_navigation_stops_active_controller(tmp_path: Any) -> None:
         command_runner=ip_runner,
         controller_factory=BlockingNavigationController,
     )
+    prime_startup_ready(agent)
     agent.execute_command(navigation_command())
     agent.execute_command(
         {
@@ -469,6 +800,7 @@ def test_recovery_resumes_known_mission_without_submission(tmp_path: Any) -> Non
                 "phase": "mission",
                 "phase_status": "running",
                 "mission_id": "mission-existing",
+                "navigation_localization": successful_localization(),
                 "started_at": now,
                 "updated_at": now,
                 "phase_events": [],
@@ -494,8 +826,150 @@ def test_recovery_resumes_known_mission_without_submission(tmp_path: Any) -> Non
         command_runner=ip_runner,
         controller_factory=factory,
     )
+    prime_startup_ready(agent)
     agent.recover_navigation()
     assert agent.navigation_thread is not None
     agent.navigation_thread.join(timeout=3)
     assert controllers[0].resume_ids == ["mission-existing"]
     assert updates[-1][1]["state"] == "COMPLETED"
+
+
+def test_recovery_rechecks_readiness_before_mission_submission(tmp_path: Any) -> None:
+    updates: list[tuple[str, dict[str, Any]]] = []
+    state_path = tmp_path / "navigation.json"
+    now = datetime.now(tz=timezone.utc).isoformat().replace("+00:00", "Z")
+    state_path.write_text(
+        json.dumps(
+            {
+                "command_id": "nav-command",
+                "command_type": "NAVIGATE",
+                "target": {"x": 1.0, "y": 2.0, "theta": 0.5},
+                "status": "running",
+                "phase": "readiness",
+                "phase_status": "started",
+                "mission_id": None,
+                "started_at": now,
+                "updated_at": now,
+                "phase_events": [],
+                "terminal_acknowledged": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+    controllers: list[FakeNavigationController] = []
+
+    def factory(*args: Any, **kwargs: Any) -> FakeNavigationController:
+        controller = FakeNavigationController(*args, **kwargs)
+        controllers.append(controller)
+        return controller
+
+    agent = OrsusAgent(
+        settings(allow_insecure_http=True, navigation_state_path=state_path),
+        cloud_session=FakeSession(navigation_cloud_handler(updates)),
+        local_session=FakeSession(local_handler()),
+        command_runner=ip_runner,
+        controller_factory=factory,
+    )
+    prime_startup_ready(agent)
+
+    agent.recover_navigation()
+    assert agent.navigation_thread is not None
+    agent.navigation_thread.join(timeout=3)
+
+    assert controllers[0].navigate_calls == 1
+    assert updates[-1][1]["state"] == "COMPLETED"
+
+
+def test_recovery_does_not_resubmit_unknown_mission_submission(tmp_path: Any) -> None:
+    updates: list[tuple[str, dict[str, Any]]] = []
+    state_path = tmp_path / "navigation.json"
+    now = datetime.now(tz=timezone.utc).isoformat().replace("+00:00", "Z")
+    state_path.write_text(
+        json.dumps(
+            {
+                "command_id": "nav-command",
+                "command_type": "NAVIGATE",
+                "target": {"x": 1.0, "y": 2.0, "theta": 0.5},
+                "status": "running",
+                "phase": "mission_submission",
+                "phase_status": "started",
+                "mission_id": None,
+                "started_at": now,
+                "updated_at": now,
+                "phase_events": [],
+                "terminal_acknowledged": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+    controllers: list[FakeNavigationController] = []
+
+    def factory(*args: Any, **kwargs: Any) -> FakeNavigationController:
+        controller = FakeNavigationController(*args, **kwargs)
+        controllers.append(controller)
+        return controller
+
+    agent = OrsusAgent(
+        settings(allow_insecure_http=True, navigation_state_path=state_path),
+        cloud_session=FakeSession(navigation_cloud_handler(updates)),
+        local_session=FakeSession(local_handler()),
+        command_runner=ip_runner,
+        controller_factory=factory,
+    )
+    prime_startup_ready(agent)
+
+    agent.recover_navigation()
+
+    assert agent.navigation_thread is None
+    assert controllers[0].navigate_calls == 0
+    assert updates[-1][1]["state"] == "FAILED"
+    assert updates[-1][1]["result"]["status"] == "submission_unknown_after_restart"
+
+
+def test_recovery_restarts_idempotent_startup_without_running_mission(tmp_path: Any) -> None:
+    updates: list[tuple[str, dict[str, Any]]] = []
+    state_path = tmp_path / "startup.json"
+    now = datetime.now(tz=timezone.utc).isoformat().replace("+00:00", "Z")
+    state_path.write_text(
+        json.dumps(
+            {
+                "command_id": "startup-command",
+                "command_type": "STARTUP",
+                "target": None,
+                "status": "running",
+                "phase": "navigation_container",
+                "phase_status": "started",
+                "mission_id": None,
+                "started_at": now,
+                "updated_at": now,
+                "phase_events": [],
+                "terminal_acknowledged": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+    controllers: list[FakeNavigationController] = []
+
+    def factory(*args: Any, **kwargs: Any) -> FakeNavigationController:
+        controller = FakeNavigationController(*args, **kwargs)
+        controllers.append(controller)
+        return controller
+
+    agent = OrsusAgent(
+        settings(
+            allow_insecure_http=True,
+            navigation_state_path=state_path,
+        ),
+        cloud_session=FakeSession(navigation_cloud_handler(updates)),
+        local_session=FakeSession(local_handler()),
+        command_runner=ip_runner,
+        controller_factory=factory,
+    )
+
+    agent.recover_navigation()
+    assert agent.navigation_thread is not None
+    agent.navigation_thread.join(timeout=3)
+    assert controllers[0].startup_calls == 1
+    assert controllers[0].run_calls == 0
+    assert updates[-1][1]["state"] == "COMPLETED"
+    assert updates[-1][1]["result"]["status"] == "ready"

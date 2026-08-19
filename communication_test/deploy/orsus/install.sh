@@ -36,11 +36,12 @@ if [[ -n "$vendor_source" ]]; then
     install -d -m 755 -o root -g root "$app_root/vendor"
     tar -xzf "$vendor_source" -C "$app_root/vendor"
     chown -R root:root "$app_root/vendor"
-elif ! /usr/bin/python3 -c 'import requests, yaml' >/dev/null 2>&1; then
+    chmod -R a+rX "$app_root/vendor"
+elif ! /usr/bin/python3 -c 'import requests, websocket, yaml' >/dev/null 2>&1; then
     apt-get update
-    apt-get install -y python3-requests python3-yaml
+    apt-get install -y python3-requests python3-websocket python3-yaml
 fi
-/usr/bin/python3 -c 'import sys; sys.path.insert(0, "/opt/orsus-ecs-agent/vendor"); sys.path.insert(0, "/opt/orsus-ecs-agent"); import requests, yaml, orsus_nav; print("requests", requests.__version__, "yaml", yaml.__version__)'
+/usr/bin/python3 -c 'import sys; sys.path.insert(0, "/opt/orsus-ecs-agent/vendor"); sys.path.insert(0, "/opt/orsus-ecs-agent"); import requests, websocket, yaml, orsus_nav; print("requests", requests.__version__, "websocket-client", websocket.__version__, "yaml", yaml.__version__)'
 
 systemctl daemon-reload
 systemctl enable --now orsus-ecs-agent.service
