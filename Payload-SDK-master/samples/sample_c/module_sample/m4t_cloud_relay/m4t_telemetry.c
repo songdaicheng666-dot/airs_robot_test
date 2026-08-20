@@ -17,43 +17,22 @@
 #endif
 
 typedef struct {
-    uint64_t sequence;
-    char recordedAt[32];
-    bool psdkConnected;
-    bool flightValid;
-    uint8_t flightStatus;
-    uint8_t displayMode;
-    bool positionValid;
-    double latitudeDeg;
-    double longitudeDeg;
-    float altitudeEllipsoidM;
-    uint16_t visibleSatellites;
-    bool gpsValid;
-    int gpsFixState;
-    float horizontalAccuracyM;
-    float verticalAccuracyM;
-    uint16_t satellitesUsed;
-    bool rtkValid;
-    bool rtkConnected;
-    uint8_t rtkPositionSolution;
-    bool batteryValid;
-    uint8_t batteryPercentage;
-    float batteryVoltageV;
-    float batteryCurrentA;
-} T_M4tTelemetrySnapshot;
-
-typedef struct {
     bool flight;
     bool displayMode;
     bool position;
+    bool velocity;
     bool gps;
     bool rtkConnection;
     bool rtkPosition;
     bool battery;
+    bool homeSet;
+    bool homeInfo;
+    bool homeAltitude;
 } T_M4tSubscriptions;
 
 static pthread_mutex_t s_snapshotMutex = PTHREAD_MUTEX_INITIALIZER;
 static T_M4tTelemetrySnapshot s_snapshot;
+static T_M4tTelemetryNavigationStatus s_navigationStatus;
 static pthread_t s_telemetryThread;
 
 static void M4tTelemetry_FormatUtcNow(char *buffer, size_t bufferSize)
@@ -146,6 +125,23 @@ static void M4tTelemetry_Sample(const T_M4tSubscriptions *subscriptions, uint64_
         }
     }
 
+    if (subscriptions->velocity) {
+        T_DjiFcSubscriptionVelocity velocity = {0};
+        result = DjiFcSubscription_GetLatestValueOfTopic(
+            DJI_FC_SUBSCRIPTION_TOPIC_VELOCITY,
+            (uint8_t *) &velocity,
+            sizeof(velocity),
+            &timestamp);
+        if (result == DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS && velocity.health != 0) {
+            next.velocityValid = true;
+            next.velocityXMps = velocity.data.x;
+            next.velocityYMps = velocity.data.y;
+            next.velocityZMps = velocity.data.z;
+            next.horizontalSpeedMps = hypotf(velocity.data.x, velocity.data.y);
+            anyTopicValid = true;
+        }
+    }
+
     if (subscriptions->gps) {
         T_DjiFcSubscriptionGpsDetails gps = {0};
         result = DjiFcSubscription_GetLatestValueOfTopic(
@@ -202,6 +198,40 @@ static void M4tTelemetry_Sample(const T_M4tSubscriptions *subscriptions, uint64_
         }
     }
 
+
+    if (subscriptions->homeSet && subscriptions->homeInfo && subscriptions->homeAltitude) {
+        T_DjiFcSubscriptionHomePointSetStatus homeSet = 0;
+        T_DjiFcSubscriptionHomePointInfo homeInfo = {0};
+        T_DjiFcSubscriptionAltitudeOfHomePoint homeAltitude = 0;
+        result = DjiFcSubscription_GetLatestValueOfTopic(
+            DJI_FC_SUBSCRIPTION_TOPIC_HOME_POINT_SET_STATUS,
+            (uint8_t *) &homeSet,
+            sizeof(homeSet),
+            &timestamp);
+        if (result == DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
+            next.homeSet = homeSet == DJI_FC_SUBSCRIPTION_HOME_POINT_SET_STATUS_SUCCESS;
+            result = DjiFcSubscription_GetLatestValueOfTopic(
+                DJI_FC_SUBSCRIPTION_TOPIC_HOME_POINT_INFO,
+                (uint8_t *) &homeInfo,
+                sizeof(homeInfo),
+                &timestamp);
+        }
+        if (result == DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
+            result = DjiFcSubscription_GetLatestValueOfTopic(
+                DJI_FC_SUBSCRIPTION_TOPIC_ALTITUDE_OF_HOMEPOINT,
+                (uint8_t *) &homeAltitude,
+                sizeof(homeAltitude),
+                &timestamp);
+        }
+        if (result == DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS && next.homeSet) {
+            next.homeValid = true;
+            next.homeLatitudeDeg = homeInfo.latitude * 180.0 / M_PI;
+            next.homeLongitudeDeg = homeInfo.longitude * 180.0 / M_PI;
+            next.homeAltitudeEllipsoidM = homeAltitude;
+            anyTopicValid = true;
+        }
+    }
+
     next.psdkConnected = anyTopicValid;
     pthread_mutex_lock(&s_snapshotMutex);
     s_snapshot = next;
@@ -228,10 +258,14 @@ static void *M4tTelemetry_Task(void *argument)
     subscriptions.flight = M4tTelemetry_Subscribe(DJI_FC_SUBSCRIPTION_TOPIC_STATUS_FLIGHT, "flight status");
     subscriptions.displayMode = M4tTelemetry_Subscribe(DJI_FC_SUBSCRIPTION_TOPIC_STATUS_DISPLAYMODE, "display mode");
     subscriptions.position = M4tTelemetry_Subscribe(DJI_FC_SUBSCRIPTION_TOPIC_POSITION_FUSED, "fused position");
+    subscriptions.velocity = M4tTelemetry_Subscribe(DJI_FC_SUBSCRIPTION_TOPIC_VELOCITY, "velocity");
     subscriptions.gps = M4tTelemetry_Subscribe(DJI_FC_SUBSCRIPTION_TOPIC_GPS_DETAILS, "GPS details");
     subscriptions.rtkConnection = M4tTelemetry_Subscribe(DJI_FC_SUBSCRIPTION_TOPIC_RTK_CONNECT_STATUS, "RTK connection");
     subscriptions.rtkPosition = M4tTelemetry_Subscribe(DJI_FC_SUBSCRIPTION_TOPIC_RTK_POSITION_INFO, "RTK position info");
     subscriptions.battery = M4tTelemetry_Subscribe(DJI_FC_SUBSCRIPTION_TOPIC_BATTERY_SINGLE_INFO_INDEX1, "battery index 1");
+    subscriptions.homeSet = M4tTelemetry_Subscribe(DJI_FC_SUBSCRIPTION_TOPIC_HOME_POINT_SET_STATUS, "Home set status");
+    subscriptions.homeInfo = M4tTelemetry_Subscribe(DJI_FC_SUBSCRIPTION_TOPIC_HOME_POINT_INFO, "Home point");
+    subscriptions.homeAltitude = M4tTelemetry_Subscribe(DJI_FC_SUBSCRIPTION_TOPIC_ALTITUDE_OF_HOMEPOINT, "Home altitude");
 
     while (true) {
         M4tTelemetry_Sample(&subscriptions, ++sequence);
@@ -243,6 +277,7 @@ static void *M4tTelemetry_Task(void *argument)
 T_DjiReturnCode M4tTelemetry_Start(void)
 {
     memset(&s_snapshot, 0, sizeof(s_snapshot));
+    memset(&s_navigationStatus, 0, sizeof(s_navigationStatus));
     M4tTelemetry_FormatUtcNow(s_snapshot.recordedAt, sizeof(s_snapshot.recordedAt));
     if (pthread_create(&s_telemetryThread, NULL, M4tTelemetry_Task, NULL) != 0) {
         USER_LOG_ERROR("M4T relay could not create telemetry thread");
@@ -255,28 +290,45 @@ T_DjiReturnCode M4tTelemetry_Start(void)
 cJSON *M4tTelemetry_CreateJson(void)
 {
     T_M4tTelemetrySnapshot snapshot;
+    T_M4tTelemetryNavigationStatus navigationStatus;
     cJSON *root = cJSON_CreateObject();
     cJSON *flight = cJSON_CreateObject();
     cJSON *position = cJSON_CreateObject();
     cJSON *gps = cJSON_CreateObject();
     cJSON *rtk = cJSON_CreateObject();
     cJSON *battery = cJSON_CreateObject();
+    cJSON *aircraft = cJSON_CreateObject();
+    cJSON *velocity = cJSON_CreateObject();
+    cJSON *home = cJSON_CreateObject();
+    cJSON *rth = cJSON_CreateObject();
+    cJSON *obstacleAvoidance = cJSON_CreateObject();
+    cJSON *safety = cJSON_CreateObject();
+    cJSON *mission = cJSON_CreateObject();
     cJSON *errors = cJSON_CreateArray();
 
     if (root == NULL || flight == NULL || position == NULL || gps == NULL || rtk == NULL ||
-        battery == NULL || errors == NULL) {
+        battery == NULL || aircraft == NULL || velocity == NULL || home == NULL || rth == NULL ||
+        obstacleAvoidance == NULL || safety == NULL || mission == NULL || errors == NULL) {
         cJSON_Delete(root);
         cJSON_Delete(flight);
         cJSON_Delete(position);
         cJSON_Delete(gps);
         cJSON_Delete(rtk);
         cJSON_Delete(battery);
+        cJSON_Delete(aircraft);
+        cJSON_Delete(velocity);
+        cJSON_Delete(home);
+        cJSON_Delete(rth);
+        cJSON_Delete(obstacleAvoidance);
+        cJSON_Delete(safety);
+        cJSON_Delete(mission);
         cJSON_Delete(errors);
         return NULL;
     }
 
     pthread_mutex_lock(&s_snapshotMutex);
     snapshot = s_snapshot;
+    navigationStatus = s_navigationStatus;
     pthread_mutex_unlock(&s_snapshotMutex);
 
     cJSON_AddStringToObject(root, "recorded_at", snapshot.recordedAt);
@@ -300,6 +352,16 @@ cJSON *M4tTelemetry_CreateJson(void)
         cJSON_AddNumberToObject(position, "visible_satellites", snapshot.visibleSatellites);
     } else {
         M4tTelemetry_AddError(errors, "POSITION_UNAVAILABLE");
+    }
+
+    cJSON_AddBoolToObject(velocity, "valid", snapshot.velocityValid);
+    if (snapshot.velocityValid) {
+        cJSON_AddNumberToObject(velocity, "x_mps", snapshot.velocityXMps);
+        cJSON_AddNumberToObject(velocity, "y_mps", snapshot.velocityYMps);
+        cJSON_AddNumberToObject(velocity, "z_mps", snapshot.velocityZMps);
+        cJSON_AddNumberToObject(velocity, "horizontal_speed_mps", snapshot.horizontalSpeedMps);
+    } else {
+        M4tTelemetry_AddError(errors, "VELOCITY_UNAVAILABLE");
     }
 
     cJSON_AddBoolToObject(gps, "valid", snapshot.gpsValid);
@@ -332,11 +394,143 @@ cJSON *M4tTelemetry_CreateJson(void)
         M4tTelemetry_AddError(errors, "PSDK_NOT_READY");
     }
 
+
+    if (navigationStatus.aircraftSn[0] != '\0') {
+        cJSON_AddStringToObject(aircraft, "model",
+                               navigationStatus.aircraftModel[0] ? navigationStatus.aircraftModel : "M4T");
+        cJSON_AddStringToObject(aircraft, "sn", navigationStatus.aircraftSn);
+        cJSON_AddItemToObject(root, "aircraft", aircraft);
+        aircraft = NULL;
+    }
+    if (navigationStatus.sessionId[0] != '\0') {
+        cJSON_AddStringToObject(root, "session_id", navigationStatus.sessionId);
+    }
+
+    cJSON_AddBoolToObject(home, "is_set", snapshot.homeSet && snapshot.homeValid);
+    if (snapshot.homeSet && snapshot.homeValid) {
+        cJSON_AddNumberToObject(home, "latitude_deg", snapshot.homeLatitudeDeg);
+        cJSON_AddNumberToObject(home, "longitude_deg", snapshot.homeLongitudeDeg);
+        cJSON_AddNumberToObject(home, "altitude_ellipsoid_m", snapshot.homeAltitudeEllipsoidM);
+    }
+    cJSON_AddBoolToObject(rth, "active", navigationStatus.rthActive);
+    if (navigationStatus.rthAltitudeValid) {
+        cJSON_AddNumberToObject(rth, "altitude_m", navigationStatus.rthAltitudeM);
+    }
+    cJSON_AddBoolToObject(obstacleAvoidance, "enabled",
+                          navigationStatus.obstacleStatusValid &&
+                          navigationStatus.horizontalVisualAvoidance &&
+                          navigationStatus.upwardVisualAvoidance &&
+                          navigationStatus.downwardVisualAvoidance);
+    if (navigationStatus.obstacleStatusValid) {
+        cJSON_AddBoolToObject(obstacleAvoidance, "horizontal_visual", navigationStatus.horizontalVisualAvoidance);
+        cJSON_AddBoolToObject(obstacleAvoidance, "upward_visual", navigationStatus.upwardVisualAvoidance);
+        cJSON_AddBoolToObject(obstacleAvoidance, "downward_visual", navigationStatus.downwardVisualAvoidance);
+    }
+    cJSON_AddBoolToObject(safety, "navigation_enabled", navigationStatus.navigationEnabled);
+    cJSON_AddBoolToObject(safety, "coordinate_units_verified", navigationStatus.coordinateUnitsVerified);
+    if (navigationStatus.recoveryAction[0] != '\0') {
+        cJSON_AddStringToObject(safety, "recovery_action", navigationStatus.recoveryAction);
+    }
+    cJSON_AddBoolToObject(mission, "active", navigationStatus.missionActive);
+    if (navigationStatus.missionCommandId[0] != '\0') {
+        cJSON_AddStringToObject(mission, "command_id", navigationStatus.missionCommandId);
+    }
+    if (navigationStatus.missionPhase[0] != '\0') {
+        cJSON_AddStringToObject(mission, "phase", navigationStatus.missionPhase);
+    }
+    if (navigationStatus.missionCodeName >= 0) {
+        cJSON_AddNumberToObject(mission, "code_name", navigationStatus.missionCodeName);
+    }
+    if (navigationStatus.missionState >= 0) {
+        cJSON_AddNumberToObject(mission, "psdk_state", navigationStatus.missionState);
+    }
+    if (navigationStatus.distanceRemainingM >= 0) {
+        cJSON_AddNumberToObject(mission, "distance_remaining_m", navigationStatus.distanceRemainingM);
+    }
+    if (navigationStatus.timeRemainingS >= 0) {
+        cJSON_AddNumberToObject(mission, "time_remaining_s", navigationStatus.timeRemainingS);
+    }
+
     cJSON_AddItemToObject(root, "flight", flight);
     cJSON_AddItemToObject(root, "position", position);
     cJSON_AddItemToObject(root, "gps", gps);
     cJSON_AddItemToObject(root, "rtk", rtk);
     cJSON_AddItemToObject(root, "battery", battery);
+    cJSON_AddItemToObject(root, "velocity", velocity);
+    cJSON_AddItemToObject(root, "home", home);
+    cJSON_AddItemToObject(root, "rth", rth);
+    cJSON_AddItemToObject(root, "obstacle_avoidance", obstacleAvoidance);
+    cJSON_AddItemToObject(root, "safety", safety);
+    cJSON_AddItemToObject(root, "mission", mission);
     cJSON_AddItemToObject(root, "errors", errors);
+    cJSON_Delete(aircraft);
     return root;
+}
+
+void M4tTelemetry_GetSnapshot(T_M4tTelemetrySnapshot *snapshot)
+{
+    if (snapshot == NULL) {
+        return;
+    }
+    pthread_mutex_lock(&s_snapshotMutex);
+    *snapshot = s_snapshot;
+    pthread_mutex_unlock(&s_snapshotMutex);
+}
+
+void M4tTelemetry_GetAircraftState(T_M4tNavigationAircraftState *state)
+{
+    T_M4tTelemetrySnapshot snapshot;
+    T_M4tTelemetryNavigationStatus navigationStatus;
+
+    if (state == NULL) {
+        return;
+    }
+    pthread_mutex_lock(&s_snapshotMutex);
+    snapshot = s_snapshot;
+    navigationStatus = s_navigationStatus;
+    pthread_mutex_unlock(&s_snapshotMutex);
+    *state = (T_M4tNavigationAircraftState) {
+        .psdkConnected = snapshot.psdkConnected,
+        .flightValid = snapshot.flightValid,
+        .positionValid = snapshot.positionValid,
+        .gpsValid = snapshot.gpsValid,
+        .batteryValid = snapshot.batteryValid,
+        .velocityValid = snapshot.velocityValid,
+        .homeSet = snapshot.homeSet && snapshot.homeValid,
+        .obstacleAvoidanceEnabled = navigationStatus.obstacleStatusValid &&
+                                    navigationStatus.horizontalVisualAvoidance &&
+                                    navigationStatus.upwardVisualAvoidance &&
+                                    navigationStatus.downwardVisualAvoidance,
+        .rthAltitudeValid = navigationStatus.rthAltitudeValid,
+        .gpsFixState = snapshot.gpsFixState,
+        .satellitesUsed = snapshot.satellitesUsed,
+        .horizontalAccuracyM = snapshot.horizontalAccuracyM,
+        .verticalAccuracyM = snapshot.verticalAccuracyM,
+        .batteryPercentage = snapshot.batteryPercentage,
+        .latitudeDeg = snapshot.latitudeDeg,
+        .longitudeDeg = snapshot.longitudeDeg,
+        .altitudeEllipsoidM = snapshot.altitudeEllipsoidM,
+        .horizontalSpeedMps = snapshot.horizontalSpeedMps,
+        .rthAltitudeM = navigationStatus.rthAltitudeM,
+    };
+}
+
+void M4tTelemetry_SetNavigationStatus(const T_M4tTelemetryNavigationStatus *status)
+{
+    if (status == NULL) {
+        return;
+    }
+    pthread_mutex_lock(&s_snapshotMutex);
+    s_navigationStatus = *status;
+    pthread_mutex_unlock(&s_snapshotMutex);
+}
+
+void M4tTelemetry_GetNavigationStatus(T_M4tTelemetryNavigationStatus *status)
+{
+    if (status == NULL) {
+        return;
+    }
+    pthread_mutex_lock(&s_snapshotMutex);
+    *status = s_navigationStatus;
+    pthread_mutex_unlock(&s_snapshotMutex);
 }

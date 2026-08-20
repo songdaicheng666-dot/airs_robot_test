@@ -77,6 +77,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--env-file", type=Path, required=True, help="existing m4t-relay.env")
     parser.add_argument("--orsus-token-file", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--m4t-sn", help="expected M4T aircraft SN (or M4T_EXPECTED_AIRCRAFT_SN in env file)")
     parser.add_argument("--orsus-env-output", type=Path)
     parser.add_argument("--orsus-device-id", default="ORSUS-GO2-GSM20260003")
     parser.add_argument("--orsus-sn", default="GSM20260003")
@@ -129,6 +130,9 @@ def main() -> int:
     if args.scout_env_output and not args.scout_token_file:
         raise ValueError("--scout-env-output requires --scout-token-file")
     environment = read_env(args.env_file)
+    m4t_sn = args.m4t_sn or environment.get("M4T_EXPECTED_AIRCRAFT_SN", "")
+    if not m4t_sn or len(m4t_sn) > 64 or m4t_sn.startswith("replace_with"):
+        raise ValueError("set --m4t-sn or M4T_EXPECTED_AIRCRAFT_SN to the exact aircraft SN")
     m4t_token = validate_token("M4T_DEVICE_TOKEN", environment.get("M4T_DEVICE_TOKEN", ""))
     orsus_token = validate_token(
         "Orsus device token",
@@ -137,7 +141,7 @@ def main() -> int:
     if m4t_token == orsus_token:
         raise ValueError("M4T and Orsus device tokens must be different")
     registry = {
-        "M4T-001": {"kind": "m4t", "token": m4t_token},
+        "M4T-001": {"kind": "m4t", "token": m4t_token, "expected_sn": m4t_sn},
         args.orsus_device_id: {
             "kind": "orsus",
             "token": orsus_token,

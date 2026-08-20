@@ -17,6 +17,7 @@ OPERATOR_TOKEN = "operator-token-000000000000000000000000"
 DEVICE_TOKEN = "device-token-00000000000000000000000000"
 ORSUS_TOKEN = "orsus-token-000000000000000000000000000"
 ORSUS_DEVICE_ID = "ORSUS-GO2-GSM20260003"
+M4T_SN = "1581F6M4TTEST0001"
 
 
 def make_app(database_path: Path):
@@ -43,7 +44,9 @@ def make_multi_device_app(database_path: Path):
             command_ttl_seconds=60,
             max_poll_seconds=2,
             devices={
-                "M4T-001": DeviceSettings("M4T-001", "m4t", DEVICE_TOKEN),
+                "M4T-001": DeviceSettings(
+                    "M4T-001", "m4t", DEVICE_TOKEN, expected_sn=M4T_SN
+                ),
                 ORSUS_DEVICE_ID: DeviceSettings(
                     ORSUS_DEVICE_ID,
                     "orsus",
@@ -68,6 +71,20 @@ def startup_request(request_id: str | None = None, payload: dict | None = None) 
         "client_request_id": request_id or str(uuid.uuid4()),
         "type": "STARTUP",
         "payload": {} if payload is None else payload,
+    }
+
+
+def m4t_navigation_request(request_id: str | None = None) -> dict:
+    return {
+        "client_request_id": request_id or str(uuid.uuid4()),
+        "type": "NAVIGATE",
+        "payload": {
+            "target": {
+                "latitude_deg": 22.5001,
+                "longitude_deg": 113.9001,
+                "altitude_ellipsoid_m": 52.0,
+            }
+        },
     }
 
 
@@ -126,6 +143,100 @@ def telemetry(sequence: int = 1) -> dict:
         "battery": {"valid": True, "percentage": 87, "voltage_v": 51.2, "current_a": -1.4},
         "errors": [],
     }
+
+
+def m4t_navigation_telemetry(
+    sequence: int = 1,
+    *,
+    session_id: str = "flight-session-1",
+    mission_active: bool = False,
+) -> dict:
+    value = telemetry(sequence)
+    value.update(
+        {
+            "aircraft": {"model": "M4T", "sn": M4T_SN},
+            "velocity": {
+                "valid": True,
+                "x_mps": 0.0,
+                "y_mps": 0.0,
+                "z_mps": 0.0,
+                "horizontal_speed_mps": 0.0,
+            },
+            "home": {
+                "is_set": True,
+                "latitude_deg": 22.5,
+                "longitude_deg": 113.9,
+                "altitude_ellipsoid_m": 42.0,
+            },
+            "rth": {"altitude_m": 50.0, "active": False},
+            "obstacle_avoidance": {
+                "enabled": True,
+                "horizontal_visual": True,
+                "upward_visual": True,
+                "downward_visual": True,
+            },
+            "session_id": session_id,
+            "safety": {
+                "navigation_enabled": True,
+                "coordinate_units_verified": False,
+                "recovery_action": None,
+            },
+            "mission": {
+                "active": mission_active,
+                "command_id": "active-command" if mission_active else None,
+                "phase": "enroute" if mission_active else "idle",
+            },
+        }
+    )
+    return value
+
+
+async def post_m4t_telemetry(
+    client: AsyncClient,
+    sequence: int = 1,
+    *,
+    session_id: str = "flight-session-1",
+    mission_active: bool = False,
+) -> None:
+    response = await client.post(
+        "/v1/devices/M4T-001/telemetry",
+        headers=auth(DEVICE_TOKEN),
+        json=m4t_navigation_telemetry(
+            sequence,
+            session_id=session_id,
+            mission_active=mission_active,
+        ),
+    )
+    assert response.status_code == 202
+
+
+async def complete_m4t_startup(client: AsyncClient, session_id: str = "flight-session-1") -> str:
+    created = await client.post(
+        "/v1/devices/M4T-001/commands",
+        headers=auth(OPERATOR_TOKEN),
+        json=startup_request(),
+    )
+    assert created.status_code == 201
+    command_id = created.json()["command_id"]
+    claimed = await client.get(
+        "/v1/devices/M4T-001/commands/next?timeout_s=0",
+        headers=auth(DEVICE_TOKEN),
+    )
+    assert claimed.json()["command_id"] == command_id
+    completed = await client.post(
+        f"/v1/devices/M4T-001/commands/{command_id}/state",
+        headers=auth(DEVICE_TOKEN),
+        json={
+            "state": "COMPLETED",
+            "result": {
+                "status": "ready",
+                "session_id": session_id,
+                "aircraft_sn": M4T_SN,
+            },
+        },
+    )
+    assert completed.status_code == 200
+    return command_id
 
 
 def orsus_telemetry(sn: str = "GSM20260003", sequence: int = 1) -> dict:
@@ -398,12 +509,13 @@ async def test_startup_validation_lifecycle_and_navigation_conflict(tmp_path: Pa
         assert rejected.status_code == 403
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="https://test") as client:
-        wrong_kind = await client.post(
+        missing_identity = await client.post(
             "/v1/devices/M4T-001/commands",
             headers=auth(OPERATOR_TOKEN),
             json=startup_request(),
         )
-        assert wrong_kind.status_code == 422
+        assert missing_identity.status_code == 409
+        assert "telemetry" in missing_identity.json()["detail"]
 
         invalid = await client.post(
             f"/v1/devices/{ORSUS_DEVICE_ID}/commands",
@@ -646,6 +758,135 @@ async def test_time_endpoint_accepts_operator_and_device_tokens(tmp_path: Path) 
             assert response.json()["server_time"].endswith("Z")
             assert response.json()["unix_time_ns"] > 0
         assert (await client.get("/v1/time")).status_code == 401
+
+
+@pytest.mark.anyio
+async def test_m4t_schema_startup_single_use_cancel_and_return_home(tmp_path: Path) -> None:
+    app = make_multi_device_app(tmp_path / "relay.db")
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="https://test") as client:
+        await post_m4t_telemetry(client)
+
+        wrong_schema = await client.post(
+            "/v1/devices/M4T-001/commands",
+            headers=auth(OPERATOR_TOKEN),
+            json=navigation_request(),
+        )
+        assert wrong_schema.status_code == 422
+
+        startup_id = await complete_m4t_startup(client)
+        navigation = await client.post(
+            "/v1/devices/M4T-001/commands",
+            headers=auth(OPERATOR_TOKEN),
+            json=m4t_navigation_request(),
+        )
+        assert navigation.status_code == 201
+        navigation_id = navigation.json()["command_id"]
+        assert app.state.store.get_command(startup_id)["startup_consumed_by"] == navigation_id
+        claimed_navigation = await client.get(
+            "/v1/devices/M4T-001/commands/next?timeout_s=0",
+            headers=auth(DEVICE_TOKEN),
+        )
+        assert claimed_navigation.json()["command_id"] == navigation_id
+
+        return_conflict = await client.post(
+            "/v1/devices/M4T-001/commands",
+            headers=auth(OPERATOR_TOKEN),
+            json={"client_request_id": str(uuid.uuid4()), "type": "RETURN_HOME", "payload": {}},
+        )
+        assert return_conflict.status_code == 409
+
+        cancel = await client.post(
+            "/v1/devices/M4T-001/commands",
+            headers=auth(OPERATOR_TOKEN),
+            json={
+                "client_request_id": str(uuid.uuid4()),
+                "type": "CANCEL_NAVIGATION",
+                "payload": {"navigation_command_id": navigation_id},
+            },
+        )
+        assert cancel.status_code == 201
+
+        terminal = await client.post(
+            f"/v1/devices/M4T-001/commands/{navigation_id}/state",
+            headers=auth(DEVICE_TOKEN),
+            json={"state": "COMPLETED", "result": {"status": "arrived"}},
+        )
+        assert terminal.status_code == 200
+        claimed_cancel = await client.get(
+            "/v1/devices/M4T-001/commands/next?timeout_s=0",
+            headers=auth(DEVICE_TOKEN),
+        )
+        assert claimed_cancel.json()["command_id"] == cancel.json()["command_id"]
+        cancel_terminal = await client.post(
+            f"/v1/devices/M4T-001/commands/{cancel.json()['command_id']}/state",
+            headers=auth(DEVICE_TOKEN),
+            json={"state": "COMPLETED", "result": {"status": "landed"}},
+        )
+        assert cancel_terminal.status_code == 200
+
+        reused = await client.post(
+            "/v1/devices/M4T-001/commands",
+            headers=auth(OPERATOR_TOKEN),
+            json=m4t_navigation_request(),
+        )
+        assert reused.status_code == 409
+        assert "STARTUP" in reused.json()["detail"]
+
+        returned = await client.post(
+            "/v1/devices/M4T-001/commands",
+            headers=auth(OPERATOR_TOKEN),
+            json={"client_request_id": str(uuid.uuid4()), "type": "RETURN_HOME", "payload": {}},
+        )
+        assert returned.status_code == 201
+        serialized = await client.post(
+            "/v1/devices/M4T-001/commands",
+            headers=auth(OPERATOR_TOKEN),
+            json=startup_request(),
+        )
+        assert serialized.status_code == 409
+        assert returned.json()["command_id"] in serialized.json()["detail"]
+
+
+@pytest.mark.anyio
+async def test_m4t_startup_invalid_after_session_change_expiry_or_ecs_restart(tmp_path: Path) -> None:
+    database = tmp_path / "relay.db"
+    app = make_multi_device_app(database)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="https://test") as client:
+        await post_m4t_telemetry(client)
+        startup_id = await complete_m4t_startup(client)
+        await post_m4t_telemetry(client, sequence=2, session_id="flight-session-2")
+        changed = await client.post(
+            "/v1/devices/M4T-001/commands",
+            headers=auth(OPERATOR_TOKEN),
+            json=m4t_navigation_request(),
+        )
+        assert changed.status_code == 409
+
+        await post_m4t_telemetry(client, sequence=3)
+        new_startup = await complete_m4t_startup(client)
+        with sqlite3.connect(database) as connection:
+            connection.execute(
+                "UPDATE commands SET terminal_at = terminal_at - 301 WHERE command_id = ?",
+                (new_startup,),
+            )
+        expired = await client.post(
+            "/v1/devices/M4T-001/commands",
+            headers=auth(OPERATOR_TOKEN),
+            json=m4t_navigation_request(),
+        )
+        assert expired.status_code == 409
+
+        await complete_m4t_startup(client)
+
+    restarted = make_multi_device_app(database)
+    async with AsyncClient(transport=ASGITransport(app=restarted), base_url="https://test") as client:
+        after_restart = await client.post(
+            "/v1/devices/M4T-001/commands",
+            headers=auth(OPERATOR_TOKEN),
+            json=m4t_navigation_request(),
+        )
+        assert after_restart.status_code == 409
+        assert startup_id != new_startup
 
 
 def test_store_migrates_legacy_command_table(tmp_path: Path) -> None:

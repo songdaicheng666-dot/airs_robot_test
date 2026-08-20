@@ -26,6 +26,8 @@ file(GLOB_RECURSE MODULE_COMMON_SRC ../common/*.c)
 file(GLOB_RECURSE MODULE_HAL_SRC hal/*.c)
 file(GLOB_RECURSE MODULE_APP_SRC application/*.c)
 set(MODULE_SAMPLE_SRC
+        ../../../module_sample/m4t_cloud_relay/m4t_navigation_core.c
+        ../../../module_sample/m4t_cloud_relay/m4t_navigation.c
         ../../../module_sample/m4t_cloud_relay/m4t_telemetry.c
         ../../../module_sample/m4t_cloud_relay/test_m4t_cloud_relay.c
         ../../../module_sample/utils/cJSON.c)

@@ -3,5 +3,11 @@
   "device_id": "M4T-001",
   "device_token": "replace_with_at_least_32_random_characters",
   "poll_timeout_seconds": 25,
-  "heartbeat_interval_seconds": 5
+  "heartbeat_interval_seconds": 5,
+  "navigation": {
+    "enabled": false,
+    "coordinate_units_verified": false,
+    "expected_aircraft_sn": "replace_with_M4T_aircraft_SN",
+    "state_file_path": "/home/dji/m4t-communication-test/state/navigation-state.json"
+  }
 }

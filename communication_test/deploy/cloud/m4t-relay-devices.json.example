@@ -1,7 +1,8 @@
 {
   "M4T-001": {
     "kind": "m4t",
-    "token": "replace_with_existing_m4t_device_token"
+    "token": "replace_with_existing_m4t_device_token",
+    "expected_sn": "replace_with_M4T_aircraft_SN"
   },
   "ORSUS-GO2-GSM20260003": {
     "kind": "orsus",

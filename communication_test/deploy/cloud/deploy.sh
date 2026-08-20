@@ -42,6 +42,7 @@ if [[ ! -f "$env_file" ]]; then
         printf 'M4T_OPERATOR_TOKEN=%s\n' "$operator_token"
         printf 'M4T_DEVICE_TOKEN=%s\n' "$device_token"
         printf 'M4T_DEVICE_ID=M4T-001\n'
+        printf 'M4T_EXPECTED_AIRCRAFT_SN=replace_with_M4T_aircraft_SN\n'
         printf 'M4T_DATABASE_PATH=/var/lib/m4t-relay/relay.db\n'
         printf 'M4T_ONLINE_THRESHOLD_SECONDS=15\n'
         printf 'M4T_COMMAND_LEASE_SECONDS=35\n'

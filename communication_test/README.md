@@ -3,6 +3,7 @@
 通过 ECS 启动机器人连接并自检的独立 demo 见 [`startup_test/README.md`](../startup_test/README.md)；
 后续下发 Go2/Scout 导航目标、远程取消并生成通信指标报告的流程见
 [`navigation_test/README.md`](../navigation_test/README.md)。原有 PING/STATUS_QUERY 联通测试仍可独立使用。
+M4T 单目标客户端见 [`m4t_navigation_test/README.md`](../m4t_navigation_test/README.md)。
 
 这套程序用于验证以下链路：
 
@@ -12,8 +13,9 @@
 
 `PING` 和 `STATUS_QUERY` 仍用于无运动联通测试。Go2/Scout 的 `STARTUP` 只通过独立的
 `startup_test` 客户端开放，`NAVIGATE`/`CANCEL_NAVIGATION` 只通过 `navigation_test` 开放；
-这些写操作均受设备类型、固定地图、单活动任务、5G 路由和传输安全门禁保护。
-M4T 没有新增 FlyTo、起飞或电机启动权限，联调时仍应保持落地且电机关闭。
+这些写操作均受设备类型、单活动任务、身份和传输安全门禁保护。M4T 已实现独立的
+`STARTUP`、单目标 `NAVIGATE`、`CANCEL_NAVIGATION` 和 `RETURN_HOME`，但私密配置默认关闭，
+坐标单位未在 DJI Assistant 验证前也会阻断 STARTUP。
 
 ## 目录
 
@@ -89,7 +91,8 @@ sudo nano /etc/m4t-relay.env
 sudo nano /etc/m4t-relay-devices.json
 ```
 
-`M4T_DEVICE_TOKEN` 和注册表中 `M4T-001.token` 必须是同一枚 Token。注册表中的 Orsus
+`M4T_DEVICE_TOKEN` 和注册表中 `M4T-001.token` 必须是同一枚 Token，`M4T-001.expected_sn`
+必须是飞机的精确 SN。注册表中的 Orsus
 Token 必须与 `/etc/orsus-ecs-agent.env` 一致。替换占位值后安装 systemd 和 Nginx 配置：
 
 ```bash
@@ -179,6 +182,11 @@ Payload-SDK-master/samples/sample_c/platform/linux/manifold3/app_json/m4t_relay_
 - `USER_APP_ID` 必须与 `app_json/app.json` 中的 `user_app_id` 相同。
 - Relay 配置中填入云端的 `M4T_DEVICE_TOKEN`，不要填 Operator Token。
 - HTTP 联调时 `base_url` 保持 `http://120.24.74.70`。
+- `navigation.expected_aircraft_sn` 必须与 ECS 注册表一致。
+- `navigation.state_file_path` 的父目录必须存在、仅 `dji` 可写，并位于持久化存储。
+- 初次部署保持 `navigation.enabled=false` 和 `coordinate_units_verified=false`。只有在 DJI Assistant
+  模拟器确认 M4T 3.16 单目标接口确实按“度”解释经纬度后，才可在模拟器配置中将两项设为 `true`；
+  该配置变更本身是人工验收声明。
 
 ## 5. 在妙算 3 上原生编译
 
@@ -231,6 +239,7 @@ cmake --build build-m4t-relay \
 ```bash
 cd /home/dji/m4t-communication-test/native-build/source
 install -d -m 700 ../run
+install -d -m 700 /home/dji/m4t-communication-test/state
 install -m 700 build-m4t-relay/bin/dji_sdk_demo_on_manifold3 ../run/
 install -m 600 \
   Payload-SDK-master/samples/sample_c/platform/linux/manifold3/app_json/m4t_relay_config.json \
@@ -248,7 +257,7 @@ dji_app_ctl start Smart3DExplore
 运行时不应出现 Token 内容，正常日志会包含：
 
 ```text
-M4T cloud relay service started; flight-control commands are disabled
+M4T cloud relay service started; navigation_enabled=false, coordinate_units_verified=false
 ```
 
 此时在电脑端执行：
@@ -267,23 +276,57 @@ python3 -m communication_test.pc.client status
 - `altitude_ellipsoid_m`：WGS84 参考椭球高，不是海拔高。
 - `horizontal_accuracy_m/vertical_accuracy_m`：米，已从 PSDK 毫米转换。
 - `battery.voltage_v/current_a`：伏特和安培，已从 mV/mA 转换。
+- `velocity`：地固 NEU 速度和水平速度，单位 m/s。
+- `aircraft`、`session_id`：实际飞控 SN/机型和当前持久化飞行会话。
+- `home`、`rth`、`obstacle_avoidance`：Home 基准、返航高度/状态和三向视觉避障开关。
+- `safety`、`mission`：本地解锁条件、安全动作、当前命令、阶段和 PSDK 剩余距离/时间。
 - `valid` 只表示 PSDK 主题已成功订阅并读取，不等于定位解可用。
 - 使用位置前还必须检查 `gps.fix_state`、卫星数和精度。`fix_state: 0`、卫星数为 0、精度为极大值时，经纬度不得用于导航。
 - 某个 PSDK 主题不可用时，对应对象会返回 `valid: false`，并在 `errors` 中说明。
 
-## 8. 自动测试
+## 8. M4T 单目标导航
+
+M4T 与 Go2/Scout 不共享目标 schema。M4T 只接受
+`latitude_deg/longitude_deg/altitude_ellipsoid_m`，不接受 `theta`。先配置 HTTPS 和 Operator
+Token，再依次执行：
+
+```bash
+export RELAY_BASE_URL='https://<ecs-domain>'
+export RELAY_OPERATOR_TOKEN='<operator-token>'
+export RELAY_DEVICE_ID='M4T-001'
+
+python3 -m m4t_navigation_test.client startup
+python3 -m m4t_navigation_test.client run \
+  --latitude-deg 22.578111 \
+  --longitude-deg 113.936960 \
+  --altitude-ellipsoid-m 50.0
+python3 -m m4t_navigation_test.client return-home
+```
+
+每个 NAVIGATE 消费一次 STARTUP，ready 只保持 300 秒。地面任务可由 PSDK 自动起飞，到点后
+悬停；`cancel <navigation_command_id>` 触发 RTH，并在落地停桨后完成。到点悬停后使用
+`return-home`。飞行任务仍活动时 RETURN_HOME 返回 409，必须使用 CANCEL。
+
+固定门禁为：电量至少 50%、GPS Fix 3/4、至少 12 星、水平/垂直精度不超过 2m/3m、Home
+已设置、视觉避障开启、RTH 高度 20-120m、目标距首次 Home 不超过 100m、目标相对原始地面
+椭球高 5-30m。最低航高 10m、最大水平速度 3m/s，PC 不可覆盖。
+
+## 9. 自动测试
 
 电脑端执行云端和 Orsus Agent 测试：
 
 ```bash
 python3 -m pytest \
   communication_test/tests/test_cloud.py \
-  communication_test/tests/test_orsus_agent.py -q
+  communication_test/tests/test_orsus_agent.py \
+  communication_test/tests/test_m4t_navigation_core.py \
+  communication_test/tests/test_m4t_navigation_adapter.py \
+  m4t_navigation_test/tests -q
 ```
 
 PSDK C 代码的编译和编译期检查统一由第 5 节的妙算 3 原生 CMake 构建完成。
 
-## 9. 切换 HTTPS
+## 10. 切换 HTTPS
 
 公网 HTTP 链路通过后：
 
@@ -293,9 +336,9 @@ PSDK C 代码的编译和编译期检查统一由第 5 节的妙算 3 原生 CMa
 4. 同时修改电脑 `M4T_BASE_URL` 和妙算 `base_url` 为 `https://<域名>`。
 5. 保持 libcurl 的证书和主机名校验开启；程序中没有跳过证书校验的选项。
 
-## 10. Go2 Orsus 接入共享中继
+## 11. Go2 Orsus 接入共享中继
 
-### 10.1 网络关系
+### 11.1 网络关系
 
 Go2 Orsus 的 5G 网卡实测为：
 
@@ -313,7 +356,7 @@ eth3: 192.168.0.69/24
 随身 WiFi 再通过运营商网络和 NAT 将数据送往 ECS。Orsus 只需具备出站访问能力，ECS 不需要也
 无法通过 `192.168.0.69` 主动连接位于私网中的 Orsus。
 
-### 10.2 安装 Agent
+### 11.2 安装 Agent
 
 Orsus 使用 Ubuntu 22.04 / Python 3.10。当前设备的 APT 数据库中，`edge-core` 存在未满足的
 `bluez`/`dnsmasq-base` 依赖，直接执行 `apt install python3-requests` 会失败。不要为此运行
@@ -369,7 +412,7 @@ ssh -o HostKeyAlias=orsus-go2-5g gs@192.168.0.69 \
    journalctl -u orsus-ecs-agent -n 100 --no-pager'
 ```
 
-### 10.3 操作端验证
+### 11.3 操作端验证
 
 使用 ECS 的 Operator Token，不要使用任何设备 Token：
 
@@ -387,9 +430,10 @@ python3 -m communication_test.pc.client status
 状态中应包含 SN `GSM20260003`、`eth3` 地址、到 ECS 的路由以及 motion/scan/nav 状态。导航容器
 未运行时 `/nav/navigation_status` 返回 HTTP 500 是允许的：Agent 会把它放入 `errors`，设备仍保持在线。
 
-### 10.4 安全边界
+### 11.4 安全边界
 
-- M4T 仍只接受 `PING` 和 `STATUS_QUERY`；Orsus 额外接受严格校验的 `STARTUP`、`NAVIGATE` 和 `CANCEL_NAVIGATION`。
+- M4T 与 Orsus 都支持 STARTUP/NAVIGATE/CANCEL，但目标 schema 和设备执行器完全分离；仅 M4T
+  支持 `RETURN_HOME`。M4T 飞控写操作仍受默认关闭和模拟器坐标单位门槛保护。
 - Orsus 必须先完成 `STARTUP/ready` 才能接受 `NAVIGATE`；Agent 会同时校验当前开机周期的启动凭据和实时服务状态。
 - 每条 `NAVIGATE` 都会在提交 mission 前重新执行全局重定位并获取新鲜位姿；失败或缺少位姿时不提交 mission。
 - 公网 HTTP 会明文传输 Bearer Token 和导航目标。只有 ECS、Agent 和本机三端同时显式启用不安全开关时才允许测试，结束后必须轮换 Token。

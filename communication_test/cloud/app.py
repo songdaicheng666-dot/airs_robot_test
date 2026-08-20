@@ -6,10 +6,10 @@ import math
 import time
 from datetime import datetime, timezone
 from typing import Any, Literal
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response, status
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from .config import DeviceSettings, Settings
 from .store import (
@@ -27,21 +27,15 @@ class StrictModel(BaseModel):
 
 class CommandCreate(StrictModel):
     client_request_id: UUID
-    type: Literal["PING", "STATUS_QUERY", "STARTUP", "NAVIGATE", "CANCEL_NAVIGATION"]
+    type: Literal[
+        "PING",
+        "STATUS_QUERY",
+        "STARTUP",
+        "NAVIGATE",
+        "CANCEL_NAVIGATION",
+        "RETURN_HOME",
+    ]
     payload: dict[str, Any] = Field(default_factory=dict)
-
-    @model_validator(mode="after")
-    def validate_command_payload(self) -> "CommandCreate":
-        if self.type == "NAVIGATE":
-            parsed = NavigatePayload.model_validate(self.payload)
-            self.payload = parsed.model_dump(mode="json")
-        elif self.type == "STARTUP":
-            parsed = StartupPayload.model_validate(self.payload)
-            self.payload = parsed.model_dump(mode="json")
-        elif self.type == "CANCEL_NAVIGATION":
-            parsed = CancelNavigationPayload.model_validate(self.payload)
-            self.payload = parsed.model_dump(mode="json")
-        return self
 
 
 class CommandStateUpdate(StrictModel):
@@ -52,20 +46,39 @@ class CommandStateUpdate(StrictModel):
     device_recorded_at: datetime | None = None
 
 
-class NavigationTarget(StrictModel):
+class OrsusNavigationTarget(StrictModel):
     x: float
     y: float
     theta: float
 
     @model_validator(mode="after")
-    def finite_values(self) -> "NavigationTarget":
+    def finite_values(self) -> "OrsusNavigationTarget":
         if not all(math.isfinite(value) for value in (self.x, self.y, self.theta)):
             raise ValueError("navigation coordinates must be finite")
         return self
 
 
-class NavigatePayload(StrictModel):
-    target: NavigationTarget
+class OrsusNavigatePayload(StrictModel):
+    target: OrsusNavigationTarget
+
+
+class M4tNavigationTarget(StrictModel):
+    latitude_deg: float = Field(ge=-90, le=90)
+    longitude_deg: float = Field(ge=-180, le=180)
+    altitude_ellipsoid_m: float
+
+    @model_validator(mode="after")
+    def finite_values(self) -> "M4tNavigationTarget":
+        if not all(
+            math.isfinite(value)
+            for value in (self.latitude_deg, self.longitude_deg, self.altitude_ellipsoid_m)
+        ):
+            raise ValueError("M4T navigation coordinates must be finite")
+        return self
+
+
+class M4tNavigatePayload(StrictModel):
+    target: M4tNavigationTarget
 
 
 class StartupPayload(StrictModel):
@@ -74,6 +87,10 @@ class StartupPayload(StrictModel):
 
 class CancelNavigationPayload(StrictModel):
     navigation_command_id: UUID
+
+
+class ReturnHomePayload(StrictModel):
+    pass
 
 
 class FlightTelemetry(StrictModel):
@@ -112,6 +129,54 @@ class BatteryTelemetry(StrictModel):
     current_a: float | None = None
 
 
+class M4tAircraftTelemetry(StrictModel):
+    model: str = Field(min_length=1, max_length=64)
+    sn: str = Field(min_length=1, max_length=64)
+
+
+class M4tVelocityTelemetry(StrictModel):
+    valid: bool
+    x_mps: float | None = None
+    y_mps: float | None = None
+    z_mps: float | None = None
+    horizontal_speed_mps: float | None = Field(default=None, ge=0)
+
+
+class M4tHomeTelemetry(StrictModel):
+    is_set: bool
+    latitude_deg: float | None = Field(default=None, ge=-90, le=90)
+    longitude_deg: float | None = Field(default=None, ge=-180, le=180)
+    altitude_ellipsoid_m: float | None = None
+
+
+class M4tRthTelemetry(StrictModel):
+    altitude_m: float | None = None
+    active: bool = False
+
+
+class M4tObstacleAvoidanceTelemetry(StrictModel):
+    enabled: bool
+    horizontal_visual: bool | None = None
+    upward_visual: bool | None = None
+    downward_visual: bool | None = None
+
+
+class M4tSafetyTelemetry(StrictModel):
+    navigation_enabled: bool
+    coordinate_units_verified: bool
+    recovery_action: str | None = Field(default=None, max_length=64)
+
+
+class M4tMissionTelemetry(StrictModel):
+    active: bool
+    command_id: str | None = Field(default=None, max_length=64)
+    phase: str | None = Field(default=None, max_length=32)
+    code_name: int | None = Field(default=None, ge=0, le=255)
+    psdk_state: int | None = Field(default=None, ge=0, le=255)
+    distance_remaining_m: float | None = Field(default=None, ge=0)
+    time_remaining_s: float | None = Field(default=None, ge=0)
+
+
 class M4tTelemetryCreate(StrictModel):
     recorded_at: datetime
     sequence: int = Field(ge=0)
@@ -121,6 +186,14 @@ class M4tTelemetryCreate(StrictModel):
     gps: GpsTelemetry
     rtk: RtkTelemetry
     battery: BatteryTelemetry
+    aircraft: M4tAircraftTelemetry | None = None
+    velocity: M4tVelocityTelemetry | None = None
+    home: M4tHomeTelemetry | None = None
+    rth: M4tRthTelemetry | None = None
+    obstacle_avoidance: M4tObstacleAvoidanceTelemetry | None = None
+    session_id: str | None = Field(default=None, min_length=1, max_length=64)
+    safety: M4tSafetyTelemetry | None = None
+    mission: M4tMissionTelemetry | None = None
     errors: list[str] = Field(default_factory=list, max_length=16)
 
 
@@ -188,6 +261,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app = FastAPI(title="Edge Device Cloud Relay", version="3.2.0")
     app.state.settings = settings
     app.state.store = store
+    app.state.application_session_id = str(uuid4())
 
     def require_known_device(device_id: str) -> DeviceSettings:
         device = devices.get(device_id)
@@ -239,6 +313,53 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 detail="navigation over insecure HTTP is disabled",
             )
 
+    def validate_command_payload(command: CommandCreate, device_kind: str) -> None:
+        if command.type == "NAVIGATE":
+            model = M4tNavigatePayload if device_kind == "m4t" else OrsusNavigatePayload
+            command.payload = model.model_validate(command.payload).model_dump(mode="json")
+        elif command.type == "STARTUP":
+            command.payload = StartupPayload.model_validate(command.payload).model_dump(mode="json")
+        elif command.type == "CANCEL_NAVIGATION":
+            command.payload = CancelNavigationPayload.model_validate(command.payload).model_dump(mode="json")
+        elif command.type == "RETURN_HOME":
+            command.payload = ReturnHomePayload.model_validate(command.payload).model_dump(mode="json")
+
+    def require_m4t_binding(device: DeviceSettings) -> tuple[dict[str, str], dict[str, Any]]:
+        if not device.expected_sn:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="M4T expected SN is not configured",
+            )
+        current = store.get_device_status(device.device_id, settings.online_threshold_seconds)
+        telemetry = current.get("telemetry")
+        if not current.get("online") or not isinstance(telemetry, dict):
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="fresh M4T telemetry is required")
+        aircraft = telemetry.get("aircraft")
+        session_id = telemetry.get("session_id")
+        if not isinstance(aircraft, dict) or not isinstance(session_id, str) or not session_id:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="M4T telemetry is missing aircraft identity or session_id",
+            )
+        aircraft_model = aircraft.get("model")
+        aircraft_sn = aircraft.get("sn")
+        if aircraft_model not in {"M4T", "Matrice 4T"}:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="connected aircraft is not M4T")
+        if not isinstance(aircraft_sn, str) or not hmac.compare_digest(aircraft_sn, device.expected_sn):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="M4T aircraft SN does not match configured identity",
+            )
+        return (
+            {
+                "application_session_id": app.state.application_session_id,
+                "session_id": session_id,
+                "aircraft_model": aircraft_model,
+                "aircraft_sn": aircraft_sn,
+            },
+            telemetry,
+        )
+
     @app.get("/health")
     async def health() -> dict[str, str]:
         return {"status": "ok"}
@@ -272,19 +393,42 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         _auth: None = Depends(operator_auth),
     ) -> dict[str, Any]:
         device = require_known_device(device_id)
-        if command_request.type in {"STARTUP", "NAVIGATE", "CANCEL_NAVIGATION"}:
+        flight_commands = {"STARTUP", "NAVIGATE", "CANCEL_NAVIGATION", "RETURN_HOME"}
+        command_context: dict[str, str] | None = None
+        try:
+            validate_command_payload(command_request, device.kind)
+        except ValidationError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=exc.errors(include_url=False, include_context=False),
+            ) from exc
+        if command_request.type in flight_commands:
             require_safe_navigation_transport(request)
-            if device.kind != "orsus":
+            if device.kind == "orsus" and command_request.type == "RETURN_HOME":
                 raise HTTPException(
                     status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                    detail="robot startup and navigation commands require an Orsus device",
+                    detail="RETURN_HOME requires an M4T device",
                 )
+            if device.kind == "m4t":
+                command_context, telemetry = require_m4t_binding(device)
+                mission = telemetry.get("mission")
+                if (
+                    command_request.type == "RETURN_HOME"
+                    and isinstance(mission, dict)
+                    and mission.get("active") is True
+                ):
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail="M4T navigation is active; use CANCEL_NAVIGATION",
+                    )
         try:
             command, created = store.create_command(
                 device_id,
                 str(command_request.client_request_id),
                 command_request.type,
                 command_request.payload,
+                device_kind=device.kind,
+                command_context=command_context,
             )
         except CommandNotFound as exc:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="navigation command not found") from exc
@@ -359,6 +503,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     ) -> dict[str, Any]:
         if device.kind == "m4t" and not isinstance(telemetry, M4tTelemetryCreate):
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="expected M4T telemetry")
+        if device.kind == "m4t" and telemetry.aircraft is not None and device.expected_sn:
+            if not hmac.compare_digest(telemetry.aircraft.sn, device.expected_sn):
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail="M4T aircraft SN does not match configured identity",
+                )
         if device.kind == "orsus":
             if not isinstance(telemetry, OrsusTelemetryCreate):
                 raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="expected Orsus telemetry")

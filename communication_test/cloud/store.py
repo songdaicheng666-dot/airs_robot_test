@@ -73,7 +73,9 @@ class RelayStore:
                     received_at REAL,
                     terminal_at REAL,
                     device_recorded_at TEXT,
-                    error_message TEXT
+                    error_message TEXT,
+                    context_json TEXT,
+                    startup_consumed_by TEXT
                 );
                 CREATE INDEX IF NOT EXISTS idx_commands_delivery
                     ON commands(device_id, state, created_at);
@@ -94,6 +96,8 @@ class RelayStore:
                 "received_at": "REAL",
                 "terminal_at": "REAL",
                 "device_recorded_at": "TEXT",
+                "context_json": "TEXT",
+                "startup_consumed_by": "TEXT",
             }
             for name, column_type in migrations.items():
                 if name not in columns:
@@ -124,6 +128,8 @@ class RelayStore:
             "progress": json.loads(row["progress_json"]) if row["progress_json"] else None,
             "result": json.loads(row["result_json"]) if row["result_json"] else None,
             "error": row["error_message"],
+            "context": json.loads(row["context_json"]) if row["context_json"] else None,
+            "startup_consumed_by": row["startup_consumed_by"],
         }
 
     def create_command(
@@ -132,10 +138,18 @@ class RelayStore:
         client_request_id: str,
         command_type: str,
         payload: dict[str, Any],
+        *,
+        device_kind: str = "orsus",
+        command_context: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any], bool]:
         payload_json = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
         now = time.time()
         command_id = str(uuid.uuid4())
+        context_json = (
+            json.dumps(command_context, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+            if command_context is not None
+            else None
+        )
         with self._write_lock, self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             existing = connection.execute(
@@ -164,6 +178,59 @@ class RelayStore:
                 if target["command_type"] != "NAVIGATE":
                     connection.rollback()
                     raise InvalidStateTransition("cancel target is not a navigation command")
+                if device_kind == "m4t" and target["state"] not in {
+                    "QUEUED",
+                    "DELIVERED",
+                    "RECEIVED",
+                    "RUNNING",
+                }:
+                    connection.rollback()
+                    raise InvalidStateTransition("M4T navigation is not active; use RETURN_HOME after arrival")
+                if device_kind == "m4t":
+                    active_safety_command = connection.execute(
+                        """
+                        SELECT command_id FROM commands
+                        WHERE device_id = ? AND command_type IN ('CANCEL_NAVIGATION', 'RETURN_HOME')
+                          AND state IN ('QUEUED', 'DELIVERED', 'RECEIVED', 'RUNNING')
+                        LIMIT 1
+                        """,
+                        (device_id,),
+                    ).fetchone()
+                    if active_safety_command is not None:
+                        connection.rollback()
+                        raise ActiveNavigationConflict(
+                            f"device already has active flight command {active_safety_command['command_id']}"
+                        )
+
+            if device_kind == "m4t" and command_type == "RETURN_HOME":
+                active_navigation = connection.execute(
+                    """
+                    SELECT command_id FROM commands
+                    WHERE device_id = ? AND command_type = 'NAVIGATE'
+                      AND state IN ('QUEUED', 'DELIVERED', 'RECEIVED', 'RUNNING')
+                    LIMIT 1
+                    """,
+                    (device_id,),
+                ).fetchone()
+                if active_navigation is not None:
+                    connection.rollback()
+                    raise ActiveNavigationConflict(
+                        "M4T navigation is active; use CANCEL_NAVIGATION"
+                    )
+                active_flight_command = connection.execute(
+                    """
+                    SELECT command_id FROM commands
+                    WHERE device_id = ? AND command_type IN ('STARTUP', 'CANCEL_NAVIGATION', 'RETURN_HOME')
+                      AND state IN ('QUEUED', 'DELIVERED', 'RECEIVED', 'RUNNING')
+                    LIMIT 1
+                    """,
+                    (device_id,),
+                ).fetchone()
+                if active_flight_command is not None:
+                    connection.rollback()
+                    raise ActiveNavigationConflict(
+                        f"device already has active flight command {active_flight_command['command_id']}"
+                    )
 
             if command_type in {"STARTUP", "NAVIGATE"}:
                 connection.execute(
@@ -177,10 +244,15 @@ class RelayStore:
                     """,
                     (now, now, device_id, now),
                 )
+                active_types = (
+                    "('STARTUP', 'NAVIGATE', 'CANCEL_NAVIGATION', 'RETURN_HOME')"
+                    if device_kind == "m4t"
+                    else "('STARTUP', 'NAVIGATE')"
+                )
                 active = connection.execute(
-                    """
+                    f"""
                     SELECT command_id FROM commands
-                    WHERE device_id = ? AND command_type IN ('STARTUP', 'NAVIGATE')
+                    WHERE device_id = ? AND command_type IN {active_types}
                       AND state IN ('QUEUED', 'DELIVERED', 'RECEIVED', 'RUNNING')
                     ORDER BY created_at ASC LIMIT 1
                     """,
@@ -195,7 +267,9 @@ class RelayStore:
                 if command_type == "NAVIGATE":
                     latest_startup = connection.execute(
                         """
-                        SELECT command_id, state, result_json FROM commands
+                        SELECT command_id, state, result_json, terminal_at, context_json,
+                               startup_consumed_by
+                        FROM commands
                         WHERE device_id = ? AND command_type = 'STARTUP'
                         ORDER BY created_at DESC LIMIT 1
                         """,
@@ -211,6 +285,21 @@ class RelayStore:
                             isinstance(startup_result, dict)
                             and startup_result.get("status") == "ready"
                         )
+                        if device_kind == "m4t":
+                            try:
+                                startup_context = json.loads(latest_startup["context_json"] or "null")
+                            except json.JSONDecodeError:
+                                startup_context = None
+                            startup_ready = (
+                                startup_ready
+                                and latest_startup["startup_consumed_by"] is None
+                                and latest_startup["terminal_at"] is not None
+                                and now - latest_startup["terminal_at"] <= 300
+                                and isinstance(startup_context, dict)
+                                and startup_context == command_context
+                                and startup_result.get("session_id") == startup_context.get("session_id")
+                                and startup_result.get("aircraft_sn") == startup_context.get("aircraft_sn")
+                            )
                     if not startup_ready:
                         connection.rollback()
                         latest_id = (
@@ -227,8 +316,8 @@ class RelayStore:
                 """
                 INSERT INTO commands (
                     command_id, client_request_id, device_id, command_type, payload_json,
-                    state, created_at, updated_at, expires_at
-                ) VALUES (?, ?, ?, ?, ?, 'QUEUED', ?, ?, ?)
+                    state, created_at, updated_at, expires_at, context_json
+                ) VALUES (?, ?, ?, ?, ?, 'QUEUED', ?, ?, ?, ?)
                 """,
                 (
                     command_id,
@@ -239,8 +328,14 @@ class RelayStore:
                     now,
                     now,
                     now + self.command_ttl_seconds,
+                    context_json,
                 ),
             )
+            if device_kind == "m4t" and command_type == "NAVIGATE":
+                connection.execute(
+                    "UPDATE commands SET startup_consumed_by = ? WHERE command_id = ?",
+                    (command_id, latest_startup["command_id"]),
+                )
             row = connection.execute("SELECT * FROM commands WHERE command_id = ?", (command_id,)).fetchone()
             connection.commit()
         return self._command_dict(row), True

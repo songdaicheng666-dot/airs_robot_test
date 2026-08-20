@@ -1,6 +1,7 @@
 #include "test_m4t_cloud_relay.h"
 
 #include "m4t_telemetry.h"
+#include "m4t_navigation.h"
 #include <curl/curl.h>
 #include <dji_error.h>
 #include <dji_logger.h>
@@ -31,6 +32,7 @@ typedef struct {
     char deviceToken[M4T_RELAY_MAX_TOKEN];
     long pollTimeoutSeconds;
     unsigned int heartbeatIntervalSeconds;
+    T_M4tNavigationConfig navigation;
 } T_M4tRelayConfig;
 
 typedef struct {
@@ -41,6 +43,13 @@ typedef struct {
 static T_M4tRelayConfig s_config;
 static pthread_t s_pollThread;
 static pthread_t s_heartbeatThread;
+static pthread_mutex_t s_navigationWorkerMutex = PTHREAD_MUTEX_INITIALIZER;
+static bool s_navigationWorkerRunning;
+
+typedef struct {
+    char commandId[M4T_RELAY_MAX_DEVICE_ID];
+    cJSON *command;
+} T_M4tNavigationJob;
 
 static bool M4tRelay_IsSafeIdentifier(const char *value)
 {
@@ -108,6 +117,8 @@ static bool M4tRelay_LoadConfig(void)
     char *configText;
     cJSON *root;
     cJSON *number;
+    cJSON *navigation;
+    cJSON *flag;
     size_t baseUrlLength;
 
     if (configPath == NULL || configPath[0] == '\0') {
@@ -131,6 +142,11 @@ static bool M4tRelay_LoadConfig(void)
 
     s_config.pollTimeoutSeconds = 25;
     s_config.heartbeatIntervalSeconds = 5;
+    s_config.navigation.navigationEnabled = false;
+    s_config.navigation.coordinateUnitsVerified = false;
+    s_config.navigation.ecsLossRthSeconds = 20;
+    snprintf(s_config.navigation.stateFilePath, sizeof(s_config.navigation.stateFilePath),
+             "m4t_navigation_state.json");
     number = cJSON_GetObjectItemCaseSensitive(root, "poll_timeout_seconds");
     if (cJSON_IsNumber(number)) {
         s_config.pollTimeoutSeconds = number->valueint;
@@ -138,6 +154,23 @@ static bool M4tRelay_LoadConfig(void)
     number = cJSON_GetObjectItemCaseSensitive(root, "heartbeat_interval_seconds");
     if (cJSON_IsNumber(number)) {
         s_config.heartbeatIntervalSeconds = (unsigned int) number->valueint;
+    }
+    navigation = cJSON_GetObjectItemCaseSensitive(root, "navigation");
+    if (cJSON_IsObject(navigation)) {
+        flag = cJSON_GetObjectItemCaseSensitive(navigation, "enabled");
+        if (cJSON_IsBool(flag)) {
+            s_config.navigation.navigationEnabled = cJSON_IsTrue(flag);
+        }
+        flag = cJSON_GetObjectItemCaseSensitive(navigation, "coordinate_units_verified");
+        if (cJSON_IsBool(flag)) {
+            s_config.navigation.coordinateUnitsVerified = cJSON_IsTrue(flag);
+        }
+        (void) M4tRelay_CopyJsonString(navigation, "expected_aircraft_sn",
+                                      s_config.navigation.expectedAircraftSn,
+                                      sizeof(s_config.navigation.expectedAircraftSn));
+        (void) M4tRelay_CopyJsonString(navigation, "state_file_path",
+                                      s_config.navigation.stateFilePath,
+                                      sizeof(s_config.navigation.stateFilePath));
     }
     cJSON_Delete(root);
 
@@ -148,7 +181,10 @@ static bool M4tRelay_LoadConfig(void)
     if ((strncmp(s_config.baseUrl, "http://", 7) != 0 && strncmp(s_config.baseUrl, "https://", 8) != 0) ||
         !M4tRelay_IsSafeIdentifier(s_config.deviceId) || strlen(s_config.deviceToken) < 32 ||
         s_config.pollTimeoutSeconds < 1 || s_config.pollTimeoutSeconds > 30 ||
-        s_config.heartbeatIntervalSeconds < 1 || s_config.heartbeatIntervalSeconds > 60) {
+        s_config.heartbeatIntervalSeconds < 1 || s_config.heartbeatIntervalSeconds > 60 ||
+        (s_config.navigation.navigationEnabled &&
+         (!M4tRelay_IsSafeIdentifier(s_config.navigation.expectedAircraftSn) ||
+          s_config.navigation.stateFilePath[0] == '\0'))) {
         USER_LOG_ERROR("M4T relay config contains an invalid value");
         return false;
     }
@@ -233,6 +269,7 @@ static CURLcode M4tRelay_Request(
     if (result == CURLE_OK) {
         curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, httpStatus);
     }
+    M4tNavigation_ReportEcsContact(result == CURLE_OK && *httpStatus >= 200 && *httpStatus < 300);
     curl_slist_free_all(headers);
     curl_easy_cleanup(curl);
     return result;
@@ -281,7 +318,8 @@ static bool M4tRelay_PostCommandState(
     const char *commandId,
     const char *state,
     cJSON *resultValue,
-    const char *error)
+    const char *error,
+    cJSON *progress)
 {
     char path[M4T_RELAY_MAX_PATH];
     cJSON *body;
@@ -303,6 +341,9 @@ static bool M4tRelay_PostCommandState(
     if (error != NULL) {
         cJSON_AddStringToObject(body, "error", error);
     }
+    if (progress != NULL) {
+        cJSON_AddItemToObject(body, "progress", cJSON_Duplicate(progress, true));
+    }
     success = M4tRelay_PostJson(path, body);
     cJSON_Delete(body);
     return success;
@@ -313,12 +354,91 @@ static void M4tRelay_PostCommandStateUntilSuccess(
     const char *state,
     cJSON *resultValue,
     const char *error,
+    cJSON *progress,
     unsigned int *seed)
 {
     unsigned int retryDelay = 1;
-    while (!M4tRelay_PostCommandState(commandId, state, resultValue, error)) {
+    while (!M4tRelay_PostCommandState(commandId, state, resultValue, error, progress)) {
         M4tRelay_Backoff(&retryDelay, seed);
     }
+}
+
+static void M4tRelay_PostNavigationProgress(cJSON *progress, void *userData)
+{
+    const char *commandId = userData;
+    (void) M4tRelay_PostCommandState(commandId, "RUNNING", NULL, NULL, progress);
+}
+
+static void M4tRelay_PostNavigationOutcome(const char *commandId, T_M4tNavigationOutcome *outcome,
+                                           unsigned int *seed)
+{
+    const char *state;
+
+    if (outcome->terminal == M4T_NAVIGATION_TERMINAL_COMPLETED) {
+        state = "COMPLETED";
+    } else if (outcome->terminal == M4T_NAVIGATION_TERMINAL_CANCELLED) {
+        state = "CANCELLED";
+    } else {
+        state = "FAILED";
+    }
+    M4tRelay_PostCommandStateUntilSuccess(commandId, state, outcome->result,
+                                          outcome->error[0] ? outcome->error : NULL, NULL, seed);
+    cJSON_Delete(outcome->result);
+    outcome->result = NULL;
+}
+
+static void *M4tRelay_NavigationTask(void *argument)
+{
+    T_M4tNavigationJob *job = argument;
+    T_M4tNavigationOutcome outcome;
+    unsigned int seed = (unsigned int) time(NULL) ^ (unsigned int) (uintptr_t) pthread_self();
+
+    outcome = M4tNavigation_ExecuteNavigate(job->commandId, job->command,
+                                            M4tRelay_PostNavigationProgress, job->commandId);
+    M4tRelay_PostNavigationOutcome(job->commandId, &outcome, &seed);
+    cJSON_Delete(job->command);
+    free(job);
+    pthread_mutex_lock(&s_navigationWorkerMutex);
+    s_navigationWorkerRunning = false;
+    pthread_mutex_unlock(&s_navigationWorkerMutex);
+    return NULL;
+}
+
+static bool M4tRelay_StartNavigationWorker(const char *commandId, cJSON *command)
+{
+    T_M4tNavigationJob *job;
+    pthread_t worker;
+    int result;
+
+    pthread_mutex_lock(&s_navigationWorkerMutex);
+    if (s_navigationWorkerRunning) {
+        pthread_mutex_unlock(&s_navigationWorkerMutex);
+        return true;
+    }
+    job = calloc(1, sizeof(*job));
+    if (job == NULL) {
+        pthread_mutex_unlock(&s_navigationWorkerMutex);
+        return false;
+    }
+    snprintf(job->commandId, sizeof(job->commandId), "%s", commandId);
+    job->command = cJSON_Duplicate(command, true);
+    if (job->command == NULL) {
+        free(job);
+        pthread_mutex_unlock(&s_navigationWorkerMutex);
+        return false;
+    }
+    s_navigationWorkerRunning = true;
+    result = pthread_create(&worker, NULL, M4tRelay_NavigationTask, job);
+    if (result != 0) {
+        s_navigationWorkerRunning = false;
+        cJSON_Delete(job->command);
+        free(job);
+        pthread_mutex_unlock(&s_navigationWorkerMutex);
+        return false;
+    }
+    pthread_detach(worker);
+    pthread_mutex_unlock(&s_navigationWorkerMutex);
+    return true;
 }
 
 static cJSON *M4tRelay_ExecuteCommand(cJSON *command, const char *commandType)
@@ -406,13 +526,54 @@ static void *M4tRelay_PollTask(void *argument)
         }
         commandId = commandIdValue->valuestring;
         commandType = commandTypeValue->valuestring;
-        M4tRelay_PostCommandStateUntilSuccess(commandId, "RECEIVED", NULL, NULL, &seed);
+        M4tRelay_PostCommandStateUntilSuccess(commandId, "RECEIVED", NULL, NULL, NULL, &seed);
+        if (strcmp(commandType, "NAVIGATE") == 0) {
+            if (!M4tRelay_StartNavigationWorker(commandId, command)) {
+                M4tRelay_PostCommandStateUntilSuccess(
+                    commandId, "FAILED", NULL, "could not start navigation worker", NULL, &seed);
+            } else {
+                cJSON *progress = cJSON_CreateObject();
+                if (progress != NULL) {
+                    cJSON_AddStringToObject(progress, "phase", "preflight");
+                    (void) M4tRelay_PostCommandState(commandId, "RUNNING", NULL, NULL, progress);
+                    cJSON_Delete(progress);
+                }
+            }
+            cJSON_Delete(command);
+            continue;
+        }
+        if (strcmp(commandType, "STARTUP") == 0) {
+            T_M4tNavigationOutcome outcome = M4tNavigation_ExecuteStartup(command);
+            M4tRelay_PostNavigationOutcome(commandId, &outcome, &seed);
+            cJSON_Delete(command);
+            continue;
+        }
+        if (strcmp(commandType, "CANCEL_NAVIGATION") == 0) {
+            cJSON *payload = cJSON_GetObjectItemCaseSensitive(command, "payload");
+            cJSON *target = cJSON_GetObjectItemCaseSensitive(payload, "navigation_command_id");
+            T_M4tNavigationOutcome outcome;
+            if (!cJSON_IsString(target)) {
+                outcome = (T_M4tNavigationOutcome) {.terminal = M4T_NAVIGATION_TERMINAL_FAILED};
+                snprintf(outcome.error, sizeof(outcome.error), "CANCEL_NAVIGATION requires navigation_command_id");
+            } else {
+                outcome = M4tNavigation_ExecuteCancel(target->valuestring);
+            }
+            M4tRelay_PostNavigationOutcome(commandId, &outcome, &seed);
+            cJSON_Delete(command);
+            continue;
+        }
+        if (strcmp(commandType, "RETURN_HOME") == 0) {
+            T_M4tNavigationOutcome outcome = M4tNavigation_ExecuteReturnHome();
+            M4tRelay_PostNavigationOutcome(commandId, &outcome, &seed);
+            cJSON_Delete(command);
+            continue;
+        }
         result = M4tRelay_ExecuteCommand(command, commandType);
         if (result == NULL) {
             M4tRelay_PostCommandStateUntilSuccess(
-                commandId, "FAILED", NULL, "unsupported command or telemetry allocation failure", &seed);
+                commandId, "FAILED", NULL, "unsupported command or telemetry allocation failure", NULL, &seed);
         } else {
-            M4tRelay_PostCommandStateUntilSuccess(commandId, "COMPLETED", result, NULL, &seed);
+            M4tRelay_PostCommandStateUntilSuccess(commandId, "COMPLETED", result, NULL, NULL, &seed);
             USER_LOG_INFO("M4T relay completed command %s (%s)", commandId, commandType);
             cJSON_Delete(result);
         }
@@ -457,6 +618,12 @@ T_DjiReturnCode DjiTest_M4tCloudRelayStartService(void)
     if (result != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
         return result;
     }
+    result = M4tNavigation_Init(&s_config.navigation, NULL);
+    if (result != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
+        USER_LOG_ERROR("M4T navigation state machine init failed, code: 0x%08llX",
+                       (unsigned long long) result);
+        return result;
+    }
     threadResult = pthread_create(&s_pollThread, NULL, M4tRelay_PollTask, NULL);
     if (threadResult == 0) {
         threadResult = pthread_create(&s_heartbeatThread, NULL, M4tRelay_HeartbeatTask, NULL);
@@ -467,6 +634,8 @@ T_DjiReturnCode DjiTest_M4tCloudRelayStartService(void)
     }
     pthread_detach(s_pollThread);
     pthread_detach(s_heartbeatThread);
-    USER_LOG_INFO("M4T cloud relay service started; flight-control commands are disabled");
+    USER_LOG_INFO("M4T cloud relay service started; navigation_enabled=%s, coordinate_units_verified=%s",
+                  s_config.navigation.navigationEnabled ? "true" : "false",
+                  s_config.navigation.coordinateUnitsVerified ? "true" : "false");
     return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
 }

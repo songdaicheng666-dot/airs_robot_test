@@ -6,7 +6,10 @@ __pycache__/
 /LoRA/
 /model+sft/
 navigation_test/results/
+m4t_navigation_test/results/
 startup_test/results/
+m4t_navigation_state.json*
 communication_test/*.env
 communication_test/.private/
 airsback
+robot-sport
