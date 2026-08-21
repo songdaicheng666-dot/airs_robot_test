@@ -19,6 +19,7 @@
 typedef struct {
     bool flight;
     bool displayMode;
+    bool controlDevice;
     bool position;
     bool velocity;
     bool gps;
@@ -104,6 +105,21 @@ static void M4tTelemetry_Sample(const T_M4tSubscriptions *subscriptions, uint64_
             next.flightValid = true;
             next.flightStatus = flightStatus;
             next.displayMode = displayMode;
+            anyTopicValid = true;
+        }
+    }
+
+    if (subscriptions->controlDevice) {
+        T_DjiFcSubscriptionControlDevice controlDevice = {0};
+        result = DjiFcSubscription_GetLatestValueOfTopic(
+            DJI_FC_SUBSCRIPTION_TOPIC_CONTROL_DEVICE,
+            (uint8_t *) &controlDevice,
+            sizeof(controlDevice),
+            &timestamp);
+        if (result == DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
+            next.controlAuthorityValid = true;
+            next.controlAuthority = controlDevice.controlAuthority;
+            next.controlAuthorityChangeReason = controlDevice.controlAuthorityChangeReason;
             anyTopicValid = true;
         }
     }
@@ -227,7 +243,7 @@ static void M4tTelemetry_Sample(const T_M4tSubscriptions *subscriptions, uint64_
             next.homeValid = true;
             next.homeLatitudeDeg = homeInfo.latitude * 180.0 / M_PI;
             next.homeLongitudeDeg = homeInfo.longitude * 180.0 / M_PI;
-            next.homeAltitudeEllipsoidM = homeAltitude;
+            next.homeAltitudeBarometricM = homeAltitude;
             anyTopicValid = true;
         }
     }
@@ -257,6 +273,8 @@ static void *M4tTelemetry_Task(void *argument)
 
     subscriptions.flight = M4tTelemetry_Subscribe(DJI_FC_SUBSCRIPTION_TOPIC_STATUS_FLIGHT, "flight status");
     subscriptions.displayMode = M4tTelemetry_Subscribe(DJI_FC_SUBSCRIPTION_TOPIC_STATUS_DISPLAYMODE, "display mode");
+    subscriptions.controlDevice = M4tTelemetry_Subscribe(DJI_FC_SUBSCRIPTION_TOPIC_CONTROL_DEVICE,
+                                                         "control authority");
     subscriptions.position = M4tTelemetry_Subscribe(DJI_FC_SUBSCRIPTION_TOPIC_POSITION_FUSED, "fused position");
     subscriptions.velocity = M4tTelemetry_Subscribe(DJI_FC_SUBSCRIPTION_TOPIC_VELOCITY, "velocity");
     subscriptions.gps = M4tTelemetry_Subscribe(DJI_FC_SUBSCRIPTION_TOPIC_GPS_DETAILS, "GPS details");
@@ -410,7 +428,8 @@ cJSON *M4tTelemetry_CreateJson(void)
     if (snapshot.homeSet && snapshot.homeValid) {
         cJSON_AddNumberToObject(home, "latitude_deg", snapshot.homeLatitudeDeg);
         cJSON_AddNumberToObject(home, "longitude_deg", snapshot.homeLongitudeDeg);
-        cJSON_AddNumberToObject(home, "altitude_ellipsoid_m", snapshot.homeAltitudeEllipsoidM);
+        /* Keep the legacy JSON key until ECS telemetry schema migration. */
+        cJSON_AddNumberToObject(home, "altitude_ellipsoid_m", snapshot.homeAltitudeBarometricM);
     }
     cJSON_AddBoolToObject(rth, "active", navigationStatus.rthActive);
     if (navigationStatus.rthAltitudeValid) {

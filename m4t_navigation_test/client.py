@@ -22,6 +22,9 @@ from navigation_test.metrics import corrected_latency_ms, summarize_rtt, utc_now
 
 
 DEFAULT_DEVICE_ID = "M4T-001"
+DEFAULT_TARGET_LATITUDE_DEG = 22.604375789
+DEFAULT_TARGET_LONGITUDE_DEG = 114.057071644
+DEFAULT_TARGET_ALTITUDE_ELLIPSOID_M = 106.0
 
 
 def write_report(
@@ -97,9 +100,13 @@ def build_parser() -> argparse.ArgumentParser:
     startup.add_argument("--wait-seconds", type=float, default=60)
 
     run = subparsers.add_parser("run", help="submit one WGS84 ellipsoid target and wait for arrival")
-    run.add_argument("--latitude-deg", type=float, required=True)
-    run.add_argument("--longitude-deg", type=float, required=True)
-    run.add_argument("--altitude-ellipsoid-m", type=float, required=True)
+    run.add_argument("--latitude-deg", type=float, default=DEFAULT_TARGET_LATITUDE_DEG)
+    run.add_argument("--longitude-deg", type=float, default=DEFAULT_TARGET_LONGITUDE_DEG)
+    run.add_argument(
+        "--altitude-ellipsoid-m",
+        type=float,
+        default=DEFAULT_TARGET_ALTITUDE_ELLIPSOID_M,
+    )
     run.add_argument("--request-id")
     run.add_argument("--wait-seconds", type=float, default=3600)
 

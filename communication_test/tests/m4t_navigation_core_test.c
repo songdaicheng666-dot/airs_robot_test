@@ -39,12 +39,21 @@ int main(void)
     char error[128];
 
     M4tNavigationCore_DefaultLimits(&limits);
+    assert(limits.minimumRouteAltitudeM == 2.0);
+    assert(limits.maximumHorizontalSpeedMps == 1);
+    assert(limits.minimumTargetHeightM == 2.0);
+    assert(limits.minimumBatteryPercentage == 10);
     assert(M4tNavigationCore_ValidatePreflight(&state, &limits, error, sizeof(error)));
-    state.batteryPercentage = 49;
+    state.batteryPercentage = 9;
     assert(!M4tNavigationCore_ValidatePreflight(&state, &limits, error, sizeof(error)));
     assert(strstr(error, "battery") != NULL);
     state = SafeState();
 
+    assert(M4tNavigationCore_ValidateTarget(&target, &home, &limits, error, sizeof(error)));
+    target.altitudeEllipsoidM = 43.9;
+    assert(!M4tNavigationCore_ValidateTarget(&target, &home, &limits, error, sizeof(error)));
+    assert(strstr(error, "2-30m") != NULL);
+    target.altitudeEllipsoidM = 44.0;
     assert(M4tNavigationCore_ValidateTarget(&target, &home, &limits, error, sizeof(error)));
     target.latitudeDeg = 22.502;
     assert(!M4tNavigationCore_ValidateTarget(&target, &home, &limits, error, sizeof(error)));

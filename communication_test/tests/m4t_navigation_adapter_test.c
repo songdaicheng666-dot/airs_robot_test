@@ -20,6 +20,9 @@ static int s_submissionMode;
 static int s_newMissionCalls;
 static int s_holdCalls;
 static int s_rthCalls;
+static int s_planningCalls;
+static int s_velocityCalls;
+static int s_heightCalls;
 static T_DjiFlightControllerStartMissionReq s_lastRequest;
 
 void DjiLogger_UserLogOutput(E_DjiLoggerConsoleLogLevel level, const char *format, ...)
@@ -106,6 +109,27 @@ static T_DjiReturnCode FakeRegisterTrajectory(FcCmderModeCoreTrajEventCbFunc cal
     return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
 }
 
+static T_DjiReturnCode FakeSetPlanningAlgo(uint8_t algo)
+{
+    assert(algo == 1);
+    s_planningCalls++;
+    return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
+}
+
+static T_DjiReturnCode FakeSetMaxVelocity(uint8_t value)
+{
+    assert(value == 1);
+    s_velocityCalls++;
+    return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
+}
+
+static T_DjiReturnCode FakeSetMinFlightHeight(float value)
+{
+    assert(value == 2.0f);
+    s_heightCalls++;
+    return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
+}
+
 static T_DjiReturnCode FakeStartMission(T_DjiFlightControllerStartMissionReq request,
                                        T_DjiFlightControllerStartMissionRsp *response)
 {
@@ -174,6 +198,9 @@ T_DjiReturnCode DjiFlightController_Init(T_DjiFlightControllerRidInfo value) { r
 T_DjiReturnCode DjiFlightController_GetGeneralInfo(T_DjiFlightControllerGeneralInfo *value) { return FakeGeneralInfo(value); }
 T_DjiReturnCode DjiFlightController_RegisterOpenMisInfoCallBack(FcCmderModeOpenMisEventCbFunc value) { return FakeRegisterMission(value); }
 T_DjiReturnCode DjiFlightController_RegisterCoreTrajCallBack(FcCmderModeCoreTrajEventCbFunc value) { return FakeRegisterTrajectory(value); }
+T_DjiReturnCode DjiFlightController_SetPlanningAlgo(uint8_t value) { return FakeSetPlanningAlgo(value); }
+T_DjiReturnCode DjiFlightController_SetMaxVelocity(uint8_t value) { return FakeSetMaxVelocity(value); }
+T_DjiReturnCode DjiFlightController_SetMinFlightHeight(float value) { return FakeSetMinFlightHeight(value); }
 T_DjiReturnCode DjiFlightController_SetModeStartMission(T_DjiFlightControllerStartMissionReq value, T_DjiFlightControllerStartMissionRsp *response) { return FakeStartMission(value, response); }
 T_DjiReturnCode DjiFlightController_StartGoHome(void) { return FakeStartGoHome(); }
 T_DjiReturnCode DjiFlightController_GetElectronicSpeedControllerStatus(E_DjiFlightControllerElectronicSpeedControllerStatus *value) { return FakeEsc(value); }
@@ -196,8 +223,12 @@ static void CompleteStartup(void)
 {
     cJSON *command = Command("{}");
     T_M4tNavigationOutcome outcome = M4tNavigation_ExecuteStartup(command);
+    cJSON *originalHome;
     assert(outcome.terminal == M4T_NAVIGATION_TERMINAL_COMPLETED);
     assert(strcmp(cJSON_GetObjectItemCaseSensitive(outcome.result, "status")->valuestring, "ready") == 0);
+    originalHome = cJSON_GetObjectItemCaseSensitive(outcome.result, "original_home");
+    assert(cJSON_GetObjectItemCaseSensitive(originalHome, "altitude_ellipsoid_m")->valuedouble ==
+           s_snapshot.altitudeEllipsoidM);
     cJSON_Delete(outcome.result);
     cJSON_Delete(command);
 }
@@ -222,6 +253,9 @@ int main(int argc, char **argv)
         .getGeneralInfo = FakeGeneralInfo,
         .registerMissionCallback = FakeRegisterMission,
         .registerTrajectoryCallback = FakeRegisterTrajectory,
+        .setPlanningAlgo = FakeSetPlanningAlgo,
+        .setMaxVelocity = FakeSetMaxVelocity,
+        .setMinFlightHeight = FakeSetMinFlightHeight,
         .setModeStartMission = FakeStartMission,
         .startGoHome = FakeStartGoHome,
         .getEscStatus = FakeEsc,
@@ -257,7 +291,7 @@ int main(int argc, char **argv)
         .homeValid = true,
         .homeLatitudeDeg = 22.5,
         .homeLongitudeDeg = 113.9,
-        .homeAltitudeEllipsoidM = 42,
+        .homeAltitudeBarometricM = 204,
     };
     config.navigationEnabled = true;
     config.coordinateUnitsVerified = true;
@@ -268,25 +302,33 @@ int main(int argc, char **argv)
     assert(s_missionCallback != NULL && s_trajectoryCallback != NULL);
 
     CompleteStartup();
+    assert(s_planningCalls == 1);
+    assert(s_velocityCalls == 1);
+    assert(s_heightCalls == 1);
     command = Command("{\"target\":{\"latitude_deg\":22.5001,\"longitude_deg\":113.9001,\"altitude_ellipsoid_m\":52}}");
     s_submissionMode = 0;
     outcome = M4tNavigation_ExecuteNavigate("arrival-command", command, NULL, NULL);
     assert(outcome.terminal == M4T_NAVIGATION_TERMINAL_COMPLETED);
     assert(s_newMissionCalls == 1);
+    assert(s_lastRequest.version == 1);
     assert(s_lastRequest.operation == 0);
-    assert(s_lastRequest.mea == 10.0f);
-    assert(s_lastRequest.fly_vel == 3);
+    assert(s_lastRequest.mea == 2.0f);
+    assert(s_lastRequest.fly_vel == 1);
     assert(s_lastRequest.cmd_mode_point_info[0].lat == 22.5001);
     assert(s_lastRequest.cmd_mode_point_info[0].lon == 113.9001);
     cJSON_Delete(outcome.result);
     cJSON_Delete(command);
 
+    s_snapshot.latitudeDeg = s_snapshot.homeLatitudeDeg;
+    s_snapshot.longitudeDeg = s_snapshot.homeLongitudeDeg;
+    s_snapshot.altitudeEllipsoidM = 42;
     CompleteStartup();
     command = Command("{\"target\":{\"latitude_deg\":22.5001,\"longitude_deg\":113.9001,\"altitude_ellipsoid_m\":52}}");
     s_submissionMode = 1;
     outcome = M4tNavigation_ExecuteNavigate("failed-command", command, NULL, NULL);
     assert(outcome.terminal == M4T_NAVIGATION_TERMINAL_FAILED);
     assert(s_holdCalls == 1);
+    assert(s_lastRequest.version == 1);
     assert(s_lastRequest.operation == 1);
     cJSON_Delete(outcome.result);
     cJSON_Delete(command);
@@ -302,6 +344,29 @@ int main(int argc, char **argv)
     cJSON_Delete(outcome.result);
     pthread_join(worker, NULL);
     assert(navigationThread.outcome.terminal == M4T_NAVIGATION_TERMINAL_CANCELLED);
+    assert(s_rthCalls == 1);
+    cJSON_Delete(navigationThread.outcome.result);
+    cJSON_Delete(navigationThread.command);
+
+    s_snapshot.flightStatus = DJI_FC_SUBSCRIPTION_FLIGHT_STATUS_ON_GROUND;
+    s_snapshot.latitudeDeg = s_snapshot.homeLatitudeDeg;
+    s_snapshot.longitudeDeg = s_snapshot.homeLongitudeDeg;
+    s_snapshot.altitudeEllipsoidM = 42;
+    s_snapshot.controlAuthorityValid = false;
+    CompleteStartup();
+    s_submissionMode = 2;
+    navigationThread = (T_NavigationThread) {0};
+    navigationThread.command = Command("{\"target\":{\"latitude_deg\":22.5001,\"longitude_deg\":113.9001,\"altitude_ellipsoid_m\":52}}");
+    assert(pthread_create(&worker, NULL, RunNavigation, &navigationThread) == 0);
+    sleep(1);
+    s_snapshot.controlAuthorityValid = true;
+    s_snapshot.controlAuthority = DJI_FC_SUBSCRIPTION_CONTROL_AUTHORITY_RC;
+    s_snapshot.controlAuthorityChangeReason = DJI_FC_SUBSCRIPTION_AUTHORITY_CHANGE_REASON_RC_PAUSE_STOP;
+    pthread_join(worker, NULL);
+    assert(navigationThread.outcome.terminal == M4T_NAVIGATION_TERMINAL_CANCELLED);
+    assert(strcmp(cJSON_GetObjectItemCaseSensitive(navigationThread.outcome.result, "status")->valuestring,
+                  "pilot_takeover") == 0);
+    assert(s_holdCalls == 1);
     assert(s_rthCalls == 1);
     cJSON_Delete(navigationThread.outcome.result);
     cJSON_Delete(navigationThread.command);

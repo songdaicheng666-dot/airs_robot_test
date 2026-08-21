@@ -91,3 +91,54 @@ def test_rejects_invalid_latitude(capsys) -> None:
     )
     assert result == 2
     assert "latitude" in capsys.readouterr().err
+
+
+def test_parser_uses_configured_test_target(monkeypatch, tmp_path: Path) -> None:
+    submitted: list[tuple[str, str, dict, str | None]] = []
+
+    class FakeClient:
+        def __init__(self, base_url: str, token: str) -> None:
+            self.samples = []
+
+        def calibrate_clock(self):
+            return {"offset_ms": 0.0}
+
+        def submit(self, device_id: str, command_type: str, payload: dict, request_id=None):
+            submitted.append((device_id, command_type, payload, request_id))
+            return {"command_id": "command-default-target"}
+
+    monkeypatch.setattr(client, "RelayClient", FakeClient)
+    monkeypatch.setattr(
+        client,
+        "wait_for_terminal",
+        lambda *_args, **_kwargs: (
+            {
+                "command_id": "command-default-target",
+                "state": "COMPLETED",
+                "created_at": "2026-01-01T00:00:00Z",
+                "terminal_at": "2026-01-01T00:00:01Z",
+            },
+            "2026-01-01T00:00:01Z",
+        ),
+    )
+
+    result = client.main(
+        [
+            "--base-url",
+            "https://ecs.test",
+            "--token",
+            TOKEN,
+            "--output-dir",
+            str(tmp_path),
+            "run",
+        ]
+    )
+
+    assert result == 0
+    assert submitted[0][2] == {
+        "target": {
+            "latitude_deg": 22.604375789,
+            "longitude_deg": 114.057071644,
+            "altitude_ellipsoid_m": 106.0,
+        }
+    }

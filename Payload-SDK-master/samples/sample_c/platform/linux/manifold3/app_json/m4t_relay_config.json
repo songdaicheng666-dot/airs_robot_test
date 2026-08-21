@@ -5,8 +5,8 @@
   "poll_timeout_seconds": 25,
   "heartbeat_interval_seconds": 5,
   "navigation": {
-    "enabled": false,
-    "coordinate_units_verified": false,
+    "enabled": true,
+    "coordinate_units_verified": true,
     "expected_aircraft_sn": "1581F7K3C252K00DLHYJ",
     "state_file_path": "/home/dji/m4t-communication-test/state/navigation-state.json"
   }

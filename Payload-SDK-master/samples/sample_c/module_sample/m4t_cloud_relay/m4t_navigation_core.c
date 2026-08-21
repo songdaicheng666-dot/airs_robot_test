@@ -24,12 +24,12 @@ void M4tNavigationCore_DefaultLimits(T_M4tNavigationSafetyLimits *limits)
         return;
     }
     *limits = (T_M4tNavigationSafetyLimits) {
-        .minimumRouteAltitudeM = 10.0,
-        .maximumHorizontalSpeedMps = 3,
+        .minimumRouteAltitudeM = 2.0,
+        .maximumHorizontalSpeedMps = 1,
         .maximumHomeRadiusM = 100.0,
-        .minimumTargetHeightM = 5.0,
+        .minimumTargetHeightM = 2.0,
         .maximumTargetHeightM = 30.0,
-        .minimumBatteryPercentage = 50,
+        .minimumBatteryPercentage = 10,
         .minimumSatellites = 12,
         .maximumHorizontalAccuracyM = 2.0,
         .maximumVerticalAccuracyM = 3.0,
@@ -123,7 +123,11 @@ bool M4tNavigationCore_ValidateTarget(const T_M4tNavigationTarget *target,
     targetHeight = target->altitudeEllipsoidM - originalHome->altitudeEllipsoidM;
     if (targetHeight < limits->minimumTargetHeightM ||
         targetHeight > limits->maximumTargetHeightM) {
-        return M4tNavigationCore_Fail(error, errorSize, "target height is outside 5-30m");
+        if (error != NULL && errorSize > 0) {
+            snprintf(error, errorSize, "target height is outside %.0f-%.0fm",
+                     limits->minimumTargetHeightM, limits->maximumTargetHeightM);
+        }
+        return false;
     }
     if (error != NULL && errorSize > 0) {
         error[0] = '\0';

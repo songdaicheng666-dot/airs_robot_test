@@ -95,6 +95,21 @@ static T_DjiReturnCode M4tNavigation_DefaultRegisterTrajectory(FcCmderModeCoreTr
     return DjiFlightController_RegisterCoreTrajCallBack(callback);
 }
 
+static T_DjiReturnCode M4tNavigation_DefaultSetPlanningAlgo(uint8_t algo)
+{
+    return DjiFlightController_SetPlanningAlgo(algo);
+}
+
+static T_DjiReturnCode M4tNavigation_DefaultSetMaxVelocity(uint8_t value)
+{
+    return DjiFlightController_SetMaxVelocity(value);
+}
+
+static T_DjiReturnCode M4tNavigation_DefaultSetMinFlightHeight(float value)
+{
+    return DjiFlightController_SetMinFlightHeight(value);
+}
+
 static T_DjiReturnCode M4tNavigation_DefaultStartMission(T_DjiFlightControllerStartMissionReq request,
                                                         T_DjiFlightControllerStartMissionRsp *response)
 {
@@ -147,6 +162,9 @@ static void M4tNavigation_LoadDefaultAdapter(T_M4tNavigationAdapter *adapter)
         .getGeneralInfo = M4tNavigation_DefaultGetGeneralInfo,
         .registerMissionCallback = M4tNavigation_DefaultRegisterMission,
         .registerTrajectoryCallback = M4tNavigation_DefaultRegisterTrajectory,
+        .setPlanningAlgo = M4tNavigation_DefaultSetPlanningAlgo,
+        .setMaxVelocity = M4tNavigation_DefaultSetMaxVelocity,
+        .setMinFlightHeight = M4tNavigation_DefaultSetMinFlightHeight,
         .setModeStartMission = M4tNavigation_DefaultStartMission,
         .startGoHome = M4tNavigation_DefaultStartGoHome,
         .getEscStatus = M4tNavigation_DefaultGetEsc,
@@ -477,6 +495,28 @@ static void M4tNavigation_UpdateTelemetrySettings(void)
 static bool M4tNavigation_IsAirborne(const T_M4tTelemetrySnapshot *snapshot)
 {
     return snapshot->flightValid && snapshot->flightStatus == DJI_FC_SUBSCRIPTION_FLIGHT_STATUS_IN_AIR;
+}
+
+static bool M4tNavigation_IsPilotTakeover(const T_M4tTelemetrySnapshot *snapshot,
+                                         bool psdkAuthoritySeen)
+{
+    if (!snapshot->controlAuthorityValid ||
+        snapshot->controlAuthority != DJI_FC_SUBSCRIPTION_CONTROL_AUTHORITY_RC) {
+        return false;
+    }
+    if (psdkAuthoritySeen) {
+        return true;
+    }
+    switch (snapshot->controlAuthorityChangeReason) {
+        case DJI_FC_SUBSCRIPTION_AUTHORITY_CHANGE_REASON_USER_REQUEST:
+        case DJI_FC_SUBSCRIPTION_AUTHORITY_CHANGE_REASON_RC_NOT_P_MODE:
+        case DJI_FC_SUBSCRIPTION_AUTHORITY_CHANGE_REASON_RC_SWITCH:
+        case DJI_FC_SUBSCRIPTION_AUTHORITY_CHANGE_REASON_RC_PAUSE_STOP:
+        case DJI_FC_SUBSCRIPTION_AUTHORITY_CHANGE_REASON_RC_ONE_KEY_GO_HOME:
+            return true;
+        default:
+            return false;
+    }
 }
 
 static bool M4tNavigation_IsLandedAndStopped(void)
@@ -823,6 +863,7 @@ void M4tNavigation_ReportEcsContact(bool successful)
 T_M4tNavigationOutcome M4tNavigation_ExecuteStartup(cJSON *command)
 {
     T_M4tNavigationOutcome outcome = M4tNavigation_NewOutcome();
+    T_DjiReturnCode planningCode;
     T_M4tNavigationAircraftState aircraft;
     T_M4tTelemetrySnapshot snapshot;
     T_M4tTelemetryNavigationStatus status;
@@ -876,12 +917,34 @@ T_M4tNavigationOutcome M4tNavigation_ExecuteStartup(cJSON *command)
         return outcome;
     }
 
+    planningCode = s_adapter.setPlanningAlgo(1);
+    if (planningCode != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
+        M4tNavigation_SetError(&outcome, "could not select manual-height planning mode: %s (0x%08llX)",
+                               M4tNavigation_ReturnCodeName(planningCode),
+                               (unsigned long long) planningCode);
+        return outcome;
+    }
+    planningCode = s_adapter.setMaxVelocity(s_limits.maximumHorizontalSpeedMps);
+    if (planningCode != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
+        M4tNavigation_SetError(&outcome, "could not set maximum mission velocity: %s (0x%08llX)",
+                               M4tNavigation_ReturnCodeName(planningCode),
+                               (unsigned long long) planningCode);
+        return outcome;
+    }
+    planningCode = s_adapter.setMinFlightHeight((float) s_limits.minimumRouteAltitudeM);
+    if (planningCode != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
+        M4tNavigation_SetError(&outcome, "could not set minimum flight height: %s (0x%08llX)",
+                               M4tNavigation_ReturnCodeName(planningCode),
+                               (unsigned long long) planningCode);
+        return outcome;
+    }
+
     pthread_mutex_lock(&s_mutex);
     if (!M4tNavigation_IsAirborne(&snapshot)) {
         s_journal.originalHome = (T_M4tNavigationTarget) {
             snapshot.homeLatitudeDeg,
             snapshot.homeLongitudeDeg,
-            snapshot.homeAltitudeEllipsoidM,
+            snapshot.altitudeEllipsoidM,
         };
         s_journal.homeValid = true;
     }
@@ -929,7 +992,7 @@ static bool M4tNavigation_HoldOrRth(T_DjiReturnCode *holdCode, const char **acti
     pthread_mutex_unlock(&s_mutex);
     if (mission.state != 0) {
         M4tTelemetry_GetAircraftState(&aircraft);
-        request.version = 0;
+        request.version = 1;
         request.operation = 1;
         request.mea = (float) s_limits.minimumRouteAltitudeM;
         request.fly_vel = s_limits.maximumHorizontalSpeedMps;
@@ -1011,6 +1074,8 @@ T_M4tNavigationOutcome M4tNavigation_ExecuteNavigate(const char *commandId, cJSO
     bool cancelled = false;
     bool safetyRth = false;
     bool missionSeenActive;
+    bool psdkAuthoritySeen = false;
+    bool pilotTakeover = false;
 
     if (!M4tNavigation_CheckStartupCapability(&outcome) || commandId == NULL ||
         !M4tNavigation_CommandBindingMatches(command, outcome.error, sizeof(outcome.error)) ||
@@ -1068,7 +1133,7 @@ T_M4tNavigationOutcome M4tNavigation_ExecuteNavigate(const char *commandId, cJSO
     M4tTelemetry_SetNavigationStatus(&telemetryStatus);
     M4tNavigation_PublishProgress("preflight", psdkCode, callback, userData);
 
-    request.version = 0;
+    request.version = 1;
     request.operation = 0;
     request.mea = (float) s_limits.minimumRouteAltitudeM;
     request.fly_vel = s_limits.maximumHorizontalSpeedMps;
@@ -1111,6 +1176,14 @@ T_M4tNavigationOutcome M4tNavigation_ExecuteNavigate(const char *commandId, cJSO
         pthread_mutex_unlock(&s_mutex);
         missionSeenActive = mission.seenActive;
         if (cancelled || safetyRth) {
+            break;
+        }
+        if (snapshot.controlAuthorityValid &&
+            snapshot.controlAuthority == DJI_FC_SUBSCRIPTION_CONTROL_AUTHORITY_PSDK) {
+            psdkAuthoritySeen = true;
+        }
+        if (missionSeenActive && M4tNavigation_IsPilotTakeover(&snapshot, psdkAuthoritySeen)) {
+            pilotTakeover = true;
             break;
         }
         phase = M4tNavigation_IsAirborne(&snapshot) ? "enroute" : "takeoff";
@@ -1172,6 +1245,18 @@ T_M4tNavigationOutcome M4tNavigation_ExecuteNavigate(const char *commandId, cJSO
         if (safetyRth) {
             M4tNavigation_SetError(&outcome, "navigation aborted by automatic safety RTH");
         }
+        return outcome;
+    }
+
+    if (pilotTakeover) {
+        M4tNavigation_FinishJournal("pilot_takeover", "pilot_control");
+        outcome.result = cJSON_CreateObject();
+        if (outcome.result != NULL) {
+            cJSON_AddStringToObject(outcome.result, "status", "pilot_takeover");
+            cJSON_AddNumberToObject(outcome.result, "authority_change_reason",
+                                    snapshot.controlAuthorityChangeReason);
+        }
+        outcome.terminal = M4T_NAVIGATION_TERMINAL_CANCELLED;
         return outcome;
     }
 

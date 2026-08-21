@@ -216,6 +216,16 @@ rsync -rc --no-times --chmod=Du=rwx,Dgo=,Fu=rw,Fgo= \
   dji@192.168.0.69:/home/dji/m4t-communication-test/native-build/source/Payload-SDK-master/
 ```
 
+必须同步完整的 `Payload-SDK-master/`，不得只替换
+`m4t_navigation_core.c` 或其他单个文件。妙算上若存在旧的并行构建目录，可能生成不含
+飞行状态机的 Relay。构建时输出必须明确包含以下三个对象：
+
+```text
+m4t_navigation.c.o
+m4t_navigation_core.c.o
+m4t_telemetry.c.o
+```
+
 登录妙算 3 后执行原生编译：
 
 ```bash
@@ -223,7 +233,12 @@ cd /home/dji/m4t-communication-test/native-build/source
 cmake -S Payload-SDK-master -B build-m4t-relay -DCMAKE_BUILD_TYPE=Release
 cmake --build build-m4t-relay \
   --target dji_sdk_demo_on_manifold3 --clean-first --parallel 4
+
+strings build-m4t-relay/bin/dji_sdk_demo_on_manifold3 | \
+  grep 'navigation_enabled=%s, coordinate_units_verified=%s'
 ```
+
+`strings` 检查无输出时不得安装 DPK；这表示构建使用了旧的非飞控 Relay 源码。
 
 妙算 3 上的生成物：
 
@@ -296,20 +311,26 @@ export RELAY_OPERATOR_TOKEN='<operator-token>'
 export RELAY_DEVICE_ID='M4T-001'
 
 python3 -m m4t_navigation_test.client startup
-python3 -m m4t_navigation_test.client run \
-  --latitude-deg 22.578111 \
-  --longitude-deg 113.936960 \
-  --altitude-ellipsoid-m 50.0
+python3 -m m4t_navigation_test.client run
 python3 -m m4t_navigation_test.client return-home
 ```
+
+`run` 当前默认目标为纬度 `22.604375789`、经度 `114.057071644`、
+WGS84 椭球高 `106.0m`；三个坐标选项仍可显式覆盖该目标。
 
 每个 NAVIGATE 消费一次 STARTUP，ready 只保持 300 秒。地面任务可由 PSDK 自动起飞，到点后
 悬停；`cancel <navigation_command_id>` 触发 RTH，并在落地停桨后完成。到点悬停后使用
 `return-home`。飞行任务仍活动时 RETURN_HOME 返回 409，必须使用 CANCEL。
 
-固定门禁为：电量至少 50%、GPS Fix 3/4、至少 12 星、水平/垂直精度不超过 2m/3m、Home
+固定门禁为：电量至少 10%、GPS Fix 3/4、至少 12 星、水平/垂直精度不超过 2m/3m、Home
 已设置、视觉避障开启、RTH 高度 20-120m、目标距首次 Home 不超过 100m、目标相对原始地面
-椭球高 5-30m。最低航高 10m、最大水平速度 3m/s，PC 不可覆盖。
+椭球高 2-30m。最低航路高度 2m、水平速度 1m/s（PSDK 该字段可表达的最小值），
+PC 不可覆盖。`2m` 是最低航路高度，不是最终目标相对高度；后者按
+“目标椭球高 - 地面 STARTUP 时 `POSITION_FUSED.altitude`”计算。
+
+PSDK `TOPIC_ALTITUDE_OF_HOMEPOINT` 实际是 ICAO/气压高度，不是 WGS84 椭球高。
+为兼容已部署 ECS schema，当前遥测 `home.altitude_ellipsoid_m` 仍临时携带该气压值，
+不得用于目标高度计算；导航状态机已改用 `POSITION_FUSED.altitude` 建立地面椭球高基准。
 
 ## 9. 自动测试
 

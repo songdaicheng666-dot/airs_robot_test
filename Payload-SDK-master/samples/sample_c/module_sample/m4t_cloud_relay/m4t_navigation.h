@@ -28,6 +28,9 @@ typedef struct {
     T_DjiReturnCode (*getGeneralInfo)(T_DjiFlightControllerGeneralInfo *generalInfo);
     T_DjiReturnCode (*registerMissionCallback)(FcCmderModeOpenMisEventCbFunc callback);
     T_DjiReturnCode (*registerTrajectoryCallback)(FcCmderModeCoreTrajEventCbFunc callback);
+    T_DjiReturnCode (*setPlanningAlgo)(uint8_t algo);
+    T_DjiReturnCode (*setMaxVelocity)(uint8_t value);
+    T_DjiReturnCode (*setMinFlightHeight)(float value);
     T_DjiReturnCode (*setModeStartMission)(T_DjiFlightControllerStartMissionReq request,
                                            T_DjiFlightControllerStartMissionRsp *response);
     T_DjiReturnCode (*startGoHome)(void);

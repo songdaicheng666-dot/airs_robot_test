@@ -19,6 +19,9 @@ typedef struct {
     bool flightValid;
     uint8_t flightStatus;
     uint8_t displayMode;
+    bool controlAuthorityValid;
+    uint8_t controlAuthority;
+    uint8_t controlAuthorityChangeReason;
     bool positionValid;
     double latitudeDeg;
     double longitudeDeg;
@@ -45,7 +48,8 @@ typedef struct {
     bool homeValid;
     double homeLatitudeDeg;
     double homeLongitudeDeg;
-    float homeAltitudeEllipsoidM;
+    /* PSDK ALTITUDE_OF_HOMEPOINT is a barometric/ICAO altitude, not WGS84 ellipsoid height. */
+    float homeAltitudeBarometricM;
 } T_M4tTelemetrySnapshot;
 
 typedef struct {
